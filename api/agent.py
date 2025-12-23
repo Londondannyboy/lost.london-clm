@@ -118,8 +118,14 @@ async def generate_response(user_message: str, session_id: str | None = None) ->
     except Exception as e:
         # Unexpected error - fail gracefully
         import traceback
-        print(f"[VIC Agent Error] {type(e).__name__}: {e}")
-        traceback.print_exc()
+        import sys
+        error_msg = f"[VIC Agent Error] {type(e).__name__}: {e}"
+        print(error_msg, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        # Return error info in dev mode for debugging
+        import os
+        if os.environ.get("DEBUG"):
+            return f"Error: {type(e).__name__}: {str(e)[:200]}"
         return (
             "I'm having a bit of trouble gathering my thoughts on that one. "
             "Could you perhaps ask me in a different way?"
