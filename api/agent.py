@@ -57,7 +57,7 @@ def get_vic_agent() -> Agent:
         if os.environ.get("GOOGLE_API_KEY"):
             model = 'google-gla:gemini-2.0-flash'
         else:
-            model = 'anthropic:claude-3-5-sonnet-latest'
+            model = 'anthropic:claude-3-5-sonnet-20241022'
 
         _vic_agent = Agent(
             model,
@@ -65,6 +65,7 @@ def get_vic_agent() -> Agent:
             system_prompt=VIC_SYSTEM_PROMPT,
             tools=[search_articles, get_user_memory],
             retries=2,  # Retry on validation failures
+            model_settings={'temperature': 0.7},  # Slightly creative but grounded
         )
     return _vic_agent
 
