@@ -273,6 +273,10 @@ async def generate_response(user_message: str, session_id: str | None = None, us
 
         # Step 2: Create prompt with actual articles
         import random
+        import sys
+
+        print(f"[VIC Agent] User name received: {user_name}", file=sys.stderr)
+
         name_instruction = ""
         if user_name:
             # Vary the greeting style
@@ -282,9 +286,15 @@ async def generate_response(user_message: str, session_id: str | None = None, us
                 f"Start with '{user_name}, ' followed by an interesting fact",
                 f"Weave {user_name}'s name in naturally mid-sentence",
             ]
-            name_instruction = f"\n\nThe user is {user_name}. {random.choice(greeting_styles)}. Don't ask for their name."
+            name_instruction = f"\n\nThe user's name is {user_name}. {random.choice(greeting_styles)}. Don't ask for their name."
         else:
-            name_instruction = "\n\nIf this is a first conversation, warmly ask what you should call them."
+            # CRITICAL: Be explicit about NOT using any name
+            name_instruction = """
+
+IMPORTANT: You do NOT know the user's name yet.
+- Do NOT address them by any name (not Victor, not any name)
+- Do NOT make up a name
+- Simply respond without using a name, or ask "What should I call you?" at the end of your response."""
 
         # Format graph connections if we have them
         graph_section = ""
