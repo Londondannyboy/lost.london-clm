@@ -87,6 +87,65 @@ async def get_voyage_embedding(text: str) -> list[float]:
         return data["data"][0]["embedding"]
 
 
+async def search_zep_graph(query: str) -> dict:
+    """
+    Search Zep knowledge graph for entity connections.
+
+    Returns facts and relationships that span multiple articles.
+    This enriches responses with connections the user might not know about.
+    """
+    if not ZEP_API_KEY:
+        return {"facts": [], "connections": []}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            # Search for edges (relationships between entities)
+            edge_response = await client.post(
+                f"https://api.getzep.com/api/v2/graph/{LOST_LONDON_GRAPH_ID}/search",
+                headers={
+                    "Authorization": f"Api-Key {ZEP_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "query": query,
+                    "limit": 5,
+                    "scope": "edges",
+                    "reranker": "rrf",
+                },
+                timeout=5.0,  # Fast timeout - enrichment shouldn't slow us down
+            )
+
+            facts = []
+            connections = []
+
+            if edge_response.status_code == 200:
+                data = edge_response.json()
+                edges = data.get("edges", [])
+
+                for edge in edges:
+                    # Extract fact
+                    if edge.get("fact"):
+                        facts.append(edge["fact"])
+
+                    # Extract connection
+                    source = edge.get("source_node_name")
+                    target = edge.get("target_node_name")
+                    relation = edge.get("relation")
+                    if source and target and relation:
+                        connections.append({
+                            "from": source,
+                            "relation": relation,
+                            "to": target
+                        })
+
+            return {"facts": facts[:3], "connections": connections[:3]}
+
+    except Exception as e:
+        import sys
+        print(f"[Zep Graph] Error: {e}", file=sys.stderr)
+        return {"facts": [], "connections": []}
+
+
 async def search_articles(ctx: RunContext[None], query: str) -> SearchResults:
     """
     Search Lost London articles using hybrid vector + keyword search.

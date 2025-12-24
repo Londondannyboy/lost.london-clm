@@ -111,3 +111,70 @@ async def search_articles_hybrid(
         return [dict(r) for r in results]
 
 
+async def get_cached_response(query: str) -> dict | None:
+    """
+    Check if we have a cached response for this query or its variations.
+
+    Returns cached response if found, None otherwise.
+    """
+    query_lower = query.lower().strip()
+
+    async with get_connection() as conn:
+        # Check if query matches any variation
+        result = await conn.fetchrow("""
+            SELECT normalized_query, response_text, article_titles
+            FROM vic_response_cache
+            WHERE response_text IS NOT NULL
+              AND ($1 = ANY(variations) OR normalized_query = $1)
+        """, query_lower)
+
+        if result and result['response_text']:
+            # Update hit count
+            await conn.execute("""
+                UPDATE vic_response_cache
+                SET hit_count = hit_count + 1, last_hit_at = NOW()
+                WHERE normalized_query = $1
+            """, result['normalized_query'])
+
+            return {
+                "response": result['response_text'],
+                "articles": result['article_titles'] or [],
+                "cached": True
+            }
+
+    return None
+
+
+async def cache_response(query: str, response: str, article_titles: list[str]) -> None:
+    """
+    Cache a response for a query.
+
+    If the query matches an existing variation, updates that entry.
+    Otherwise creates a new cache entry.
+    """
+    query_lower = query.lower().strip()
+
+    async with get_connection() as conn:
+        # Check if this query matches an existing cache entry's variations
+        existing = await conn.fetchrow("""
+            SELECT normalized_query FROM vic_response_cache
+            WHERE $1 = ANY(variations) OR normalized_query = $1
+        """, query_lower)
+
+        if existing:
+            # Update existing entry with response
+            await conn.execute("""
+                UPDATE vic_response_cache
+                SET response_text = $1, article_titles = $2, last_hit_at = NOW()
+                WHERE normalized_query = $3
+            """, response, article_titles, existing['normalized_query'])
+        else:
+            # Create new cache entry
+            await conn.execute("""
+                INSERT INTO vic_response_cache (normalized_query, variations, response_text, article_titles)
+                VALUES ($1, ARRAY[$1], $2, $3)
+                ON CONFLICT (normalized_query) DO UPDATE
+                SET response_text = $2, article_titles = $3, last_hit_at = NOW()
+            """, query_lower, response, article_titles)
+
+

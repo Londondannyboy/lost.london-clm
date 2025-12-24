@@ -11,6 +11,9 @@ before being spoken by the voice assistant.
 import os
 import time
 import json
+import random
+import asyncio
+import re
 from uuid import uuid4
 from contextlib import asynccontextmanager
 
@@ -31,6 +34,39 @@ CLM_AUTH_TOKEN = os.environ.get("CLM_AUTH_TOKEN", "")
 
 # Tokenizer for streaming response chunks
 enc = tiktoken.encoding_for_model("gpt-4o")
+
+# Vic-style filler phrases to stream immediately while searching
+FILLER_PHRASES = [
+    "Ah, let me think about that...",
+    "Now that's an interesting question...",
+    "Let me search through my collection of stories...",
+    "Hmm, let me see what I have on that...",
+    "That's a fascinating topic, give me a moment...",
+]
+
+# Topic-aware filler phrases (use {topic} placeholder)
+TOPIC_FILLER_PHRASES = [
+    "Ah, {topic}... let me see what I have on that...",
+    "{topic}, you say? Let me search my archives...",
+    "Now, {topic} is an interesting one... let me think...",
+]
+
+
+def extract_topic(user_message: str) -> str | None:
+    """Extract a potential topic/subject from the user's message."""
+    # Remove common question words
+    cleaned = re.sub(
+        r'\b(tell me about|what is|who was|where is|when did|how did|can you tell me about)\b',
+        '',
+        user_message.lower()
+    ).strip()
+    # Take first few significant words
+    words = [w for w in cleaned.split() if len(w) > 3 and w not in ('the', 'and', 'was', 'were', 'have', 'been')]
+    if words:
+        # Capitalize and return first 2-3 words as topic
+        topic = ' '.join(words[:3]).title()
+        return topic
+    return None
 
 # Security
 security = HTTPBearer(auto_error=False)
@@ -95,6 +131,43 @@ def extract_session_id(request: Request) -> str | None:
     return request.query_params.get("custom_session_id")
 
 
+def extract_user_name_from_session(session_id: str | None) -> str | None:
+    """
+    Extract user_name from session ID.
+    Format: "Name|userId" or just "userId"
+    """
+    if not session_id:
+        return None
+    if '|' in session_id:
+        name = session_id.split('|')[0]
+        # Validate it's a reasonable name
+        if name and len(name) >= 2 and len(name) <= 20 and name.isalpha():
+            return name
+    return None
+
+
+def create_chunk(chunk_id: str, created: int, content: str, session_id: str | None, is_first: bool = False) -> str:
+    """Create a single SSE chunk in OpenAI format."""
+    chunk = ChatCompletionChunk(
+        id=chunk_id,
+        choices=[
+            Choice(
+                delta=ChoiceDelta(
+                    content=content,
+                    role="assistant" if is_first else None,
+                ),
+                finish_reason=None,
+                index=0,
+            )
+        ],
+        created=created,
+        model="vic-clm-2.0",
+        object="chat.completion.chunk",
+        system_fingerprint=session_id,
+    )
+    return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+
 async def stream_response(text: str, session_id: str | None = None):
     """
     Stream response as OpenAI-compatible ChatCompletionChunks.
@@ -110,26 +183,72 @@ async def stream_response(text: str, session_id: str | None = None):
 
     for i, token_id in enumerate(tokens):
         token_text = enc.decode([token_id])
+        yield create_chunk(chunk_id, created, token_text, session_id, is_first=(i == 0))
 
-        chunk = ChatCompletionChunk(
-            id=chunk_id,
-            choices=[
-                Choice(
-                    delta=ChoiceDelta(
-                        content=token_text,
-                        role="assistant" if i == 0 else None,
-                    ),
-                    finish_reason=None,
-                    index=0,
-                )
-            ],
-            created=created,
-            model="vic-clm-2.0",
-            object="chat.completion.chunk",
-            system_fingerprint=session_id,  # Preserve session ID
-        )
+    # Send final chunk with finish_reason
+    final_chunk = ChatCompletionChunk(
+        id=chunk_id,
+        choices=[
+            Choice(
+                delta=ChoiceDelta(),
+                finish_reason="stop",
+                index=0,
+            )
+        ],
+        created=created,
+        model="vic-clm-2.0",
+        object="chat.completion.chunk",
+        system_fingerprint=session_id,
+    )
+    yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
 
-        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+    # Signal end of stream
+    yield "data: [DONE]\n\n"
+
+
+async def stream_with_padding(
+    user_message: str,
+    session_id: str | None = None,
+    user_name: str | None = None
+):
+    """
+    Stream filler phrases immediately while generating the real response in background.
+
+    This improves perceived responsiveness by giving the user immediate feedback
+    while the search/validation takes place.
+    """
+    chunk_id = str(uuid4())
+    created = int(time.time())
+
+    # Start generating the real response in the background IMMEDIATELY
+    response_task = asyncio.create_task(generate_response(user_message, session_id, user_name))
+
+    # Choose a filler phrase (topic-aware if we can extract a topic)
+    topic = extract_topic(user_message)
+    if topic and random.random() > 0.3:  # 70% chance to use topic-aware filler
+        filler = random.choice(TOPIC_FILLER_PHRASES).format(topic=topic)
+    else:
+        filler = random.choice(FILLER_PHRASES)
+
+    # Stream the filler phrase token by token
+    filler_tokens = enc.encode(filler)
+    for i, token_id in enumerate(filler_tokens):
+        token_text = enc.decode([token_id])
+        yield create_chunk(chunk_id, created, token_text, session_id, is_first=(i == 0))
+        # Small delay to make it sound natural
+        await asyncio.sleep(0.02)
+
+    # Add a natural pause (ellipsis already in filler, but add breathing room)
+    yield create_chunk(chunk_id, created, " ", session_id)
+
+    # Wait for the real response to complete
+    response_text = await response_task
+
+    # Stream the actual response
+    response_tokens = enc.encode(response_text)
+    for token_id in response_tokens:
+        token_text = enc.decode([token_id])
+        yield create_chunk(chunk_id, created, token_text, session_id)
 
     # Send final chunk with finish_reason
     final_chunk = ChatCompletionChunk(
@@ -174,6 +293,7 @@ async def chat_completions(
 
     messages = body.get("messages", [])
     session_id = extract_session_id(request)
+    user_name = extract_user_name_from_session(session_id)
 
     # Extract the user's message
     user_message = extract_user_message(messages)
@@ -186,21 +306,13 @@ async def chat_completions(
             media_type="text/event-stream",
         )
 
-    # Save user message to Zep for memory (fire and forget)
+    # Save user message to memory (fire and forget)
     if session_id:
-        # Don't await - let it run in background
-        import asyncio
         asyncio.create_task(save_user_message(session_id, user_message, "user"))
 
-    # Generate validated response using Pydantic AI agent
-    response_text = await generate_response(user_message, session_id)
+    # Generate and stream response
+    response_text = await generate_response(user_message, session_id, user_name)
 
-    # Save assistant response to Zep
-    if session_id:
-        import asyncio
-        asyncio.create_task(save_user_message(session_id, response_text, "assistant"))
-
-    # Stream the response
     return StreamingResponse(
         stream_response(response_text, session_id),
         media_type="text/event-stream",
