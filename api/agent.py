@@ -185,11 +185,13 @@ def get_groq_client() -> httpx.AsyncClient:
 # This is the SINGLE SOURCE OF TRUTH - frontend only sends user context
 VIC_SYSTEM_PROMPT = """You are VIC, the voice of Vic Keegan - a warm London historian with 370+ articles about hidden history.
 
-## ACCURACY (NON-NEGOTIABLE)
-- ONLY state facts from the search results provided
-- If a name, date, architect, or detail is NOT in results: "My articles don't mention that specifically"
-- NEVER guess or use training knowledge - only search results
-- If asked about something not in results: "I don't have that in my articles, but here's what I do know..."
+## ACCURACY (NON-NEGOTIABLE - READ THIS FIRST)
+- You will receive SOURCE MATERIAL below - USE IT!
+- ONLY talk about what's IN the source material provided
+- If user asks about "Royal Aquarium" and source has Royal Aquarium article - TALK ABOUT THAT
+- NEVER substitute a different topic (e.g., don't talk about Roman Baths when asked about Aquarium)
+- NEVER use your training knowledge - ONLY the source material below
+- If the source material doesn't match the question: "I don't have that in my articles"
 
 ## ANSWER THE QUESTION - CRITICAL
 - READ what they asked and ANSWER IT DIRECTLY
@@ -529,17 +531,26 @@ Source material:
 
 Respond naturally using facts from above. Keep it conversational and concise."""
 
-        # Step 3: Generate response with Groq (10x faster than Claude)
+        # Step 3: Generate response with Groq
         # OPTIMIZATION: Use persistent HTTP client for connection reuse
         client = get_groq_client()
+
+        # Add explicit instruction to match the question to the source
+        validation_prompt = f"""{prompt_with_sources}
+
+CRITICAL: You MUST talk about what the user asked. If they asked about "royal aquarium" and your source material contains an article about "Royal Aquarium", you MUST discuss THAT article, not something else.
+
+After your response, on a new line write:
+TOPIC_CHECK: [the main topic you discussed]"""
+
         llm_response = await client.post(
             "/chat/completions",
             json={
                 "model": "llama-3.1-8b-instant",  # 840 TPS - fastest production model
-                "max_tokens": 200,  # Short, punchy responses
+                "max_tokens": 250,  # Short, punchy responses
                 "messages": [
                     {"role": "system", "content": VIC_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt_with_sources},
+                    {"role": "user", "content": validation_prompt},
                 ],
             },
         )
@@ -551,7 +562,30 @@ Respond naturally using facts from above. Keep it conversational and concise."""
         response_text = re.sub(r'\n*facts_stated:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
         response_text = re.sub(r'\n*source_content:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
         response_text = re.sub(r'\n*source_titles:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
+        response_text = re.sub(r'\n*TOPIC_CHECK:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
         response_text = response_text.strip()
+
+        # VALIDATION: Check if response matches the query topic
+        user_query_lower = user_message.lower()
+        response_lower = response_text.lower()
+
+        # Extract key topic from user query (e.g., "royal aquarium" from "tell me about the royal aquarium")
+        query_topics = []
+        for title in article_titles:
+            title_lower = title.lower()
+            # Check if any significant words from article title match the query
+            title_words = [w for w in title_lower.split() if len(w) > 4]
+            if any(w in user_query_lower for w in title_words):
+                query_topics.append(title)
+
+        # If user asked about a topic and we have a matching article, verify response mentions it
+        if query_topics:
+            first_article_topic = query_topics[0].lower()
+            topic_words = [w for w in first_article_topic.split() if len(w) > 4 and w not in ['london', 'keegan', 'lost']]
+            if topic_words and not any(w in response_lower for w in topic_words[:3]):
+                print(f"[VIC Validation] MISMATCH! User asked about '{user_message}', article is '{query_topics[0]}', but response doesn't mention it", file=sys.stderr)
+                # Force a better response
+                response_text = f"Let me tell you about {query_topics[0].split(':')[-1].strip() if ':' in query_topics[0] else query_topics[0]}. {actual_source_content[:500]}..."
 
         # Step 5: Post-validate against the ACTUAL source content we retrieved
         validated_response = post_validate_response(response_text, actual_source_content)

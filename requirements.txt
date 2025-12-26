@@ -19,8 +19,8 @@ asyncpg>=0.30.0
 # HTTP client
 httpx>=0.28.0
 
-# Anthropic (Claude) - used by Pydantic AI
-anthropic>=0.40.0
+# Groq (Llama 3.3) - 10x faster than Claude
+groq>=0.11.0
 
 # Testing
 pytest>=8.0.0
