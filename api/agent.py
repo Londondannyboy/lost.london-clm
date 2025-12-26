@@ -11,47 +11,48 @@ from .tools import search_articles, get_user_memory
 # Lazy-loaded agent instance
 _vic_agent: Agent | None = None
 
-# OPTIMIZATION: Persistent HTTP client for Anthropic API (connection reuse)
-_anthropic_client: httpx.AsyncClient | None = None
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# OPTIMIZATION: Persistent HTTP client for Groq API (connection reuse)
+_groq_client: httpx.AsyncClient | None = None
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# Supermemory for user profiles
-SUPERMEMORY_API_KEY = os.environ.get("SUPERMEMORY_API_KEY", "")
-_supermemory_client: httpx.AsyncClient | None = None
+# Zep for user memory and conversation history
+ZEP_API_KEY = os.environ.get("ZEP_API_KEY", "")
+_zep_client: httpx.AsyncClient | None = None
 
 
-def get_supermemory_client() -> httpx.AsyncClient:
-    """Get or create persistent Supermemory HTTP client."""
-    global _supermemory_client
-    if _supermemory_client is None and SUPERMEMORY_API_KEY:
-        _supermemory_client = httpx.AsyncClient(
-            base_url="https://api.supermemory.ai",
+def get_zep_client() -> httpx.AsyncClient:
+    """Get or create persistent Zep HTTP client."""
+    global _zep_client
+    if _zep_client is None and ZEP_API_KEY:
+        _zep_client = httpx.AsyncClient(
+            base_url="https://api.getzep.com",
             headers={
-                "Authorization": f"Bearer {SUPERMEMORY_API_KEY}",
+                "Authorization": f"Api-Key {ZEP_API_KEY}",
                 "Content-Type": "application/json",
             },
             timeout=5.0,  # Fast timeout - memory enrichment shouldn't slow responses
         )
-    return _supermemory_client
+    return _zep_client
 
 
 async def get_user_memory_context(user_id: str | None) -> str:
-    """Fetch user's memory profile from Supermemory for personalization."""
-    if not user_id or not SUPERMEMORY_API_KEY:
+    """Fetch user's memory profile from Zep knowledge graph."""
+    if not user_id or not ZEP_API_KEY:
         return ""
 
     try:
-        client = get_supermemory_client()
+        client = get_zep_client()
         if not client:
             return ""
 
-        # Search for user's past interactions
+        # Search user's personal graph for facts about them
         response = await client.post(
-            "/v4/search",
+            "/api/v2/graph/search",
             json={
-                "q": "interests topics articles viewed searches",
-                "containerTags": [user_id],
-                "limit": 5,
+                "user_id": user_id,
+                "query": "user preferences interests topics discussed",
+                "limit": 10,
+                "scope": "edges",
             },
         )
 
@@ -59,95 +60,159 @@ async def get_user_memory_context(user_id: str | None) -> str:
             return ""
 
         data = response.json()
-        memories = data.get("results", [])
+        edges = data.get("edges", [])
 
-        if not memories:
+        if not edges:
             return ""
 
-        # Format memories into context
-        memory_items = []
-        for m in memories[:5]:
-            content = m.get("content", "")
-            if content:
-                memory_items.append(f"- {content}")
+        # Extract facts from edges
+        facts = []
+        for edge in edges[:5]:
+            fact = edge.get("fact")
+            if fact:
+                facts.append(f"- {fact}")
 
-        if memory_items:
+        if facts:
             import sys
-            print(f"[VIC Supermemory] Found {len(memory_items)} memories for user", file=sys.stderr)
-            return "\n\n## What I remember about this user:\n" + "\n".join(memory_items)
+            print(f"[VIC Zep] Found {len(facts)} facts for user", file=sys.stderr)
+            return "\n\n## What I remember about this user:\n" + "\n".join(facts)
 
         return ""
     except Exception as e:
         import sys
-        print(f"[VIC Supermemory] Error fetching memories: {e}", file=sys.stderr)
+        print(f"[VIC Zep] Error fetching memories: {e}", file=sys.stderr)
         return ""
 
 
-async def store_conversation_topics(user_id: str | None, topics: list[str]) -> None:
-    """Store conversation topics in Supermemory for future reference."""
-    if not user_id or not topics or not SUPERMEMORY_API_KEY:
+async def get_conversation_history(session_id: str | None) -> list[dict]:
+    """Fetch recent conversation history from Zep sessions."""
+    if not session_id or not ZEP_API_KEY:
+        return []
+
+    try:
+        client = get_zep_client()
+        if not client:
+            return []
+
+        # Get recent messages from Zep session
+        response = await client.get(
+            f"/api/v2/sessions/{session_id}/messages",
+            params={"limit": 10},
+        )
+
+        if response.status_code != 200:
+            return []
+
+        data = response.json()
+        messages = data.get("messages", [])
+
+        import sys
+        print(f"[VIC Zep] Found {len(messages)} conversation messages", file=sys.stderr)
+        return messages
+    except Exception as e:
+        import sys
+        print(f"[VIC Zep] Error fetching history: {e}", file=sys.stderr)
+        return []
+
+
+async def store_conversation_message(session_id: str | None, user_id: str | None, role: str, content: str) -> None:
+    """Store conversation message in Zep for history and fact extraction."""
+    if not session_id or not ZEP_API_KEY:
         return
 
     try:
-        client = get_supermemory_client()
+        client = get_zep_client()
         if not client:
             return
 
-        content = f"User discussed: {', '.join(topics)}"
-
+        # Ensure session exists
         await client.post(
-            "/v3/documents",
+            "/api/v2/sessions",
             json={
-                "content": content,
-                "containerTag": user_id,
-                "metadata": {
-                    "type": "conversation_topic",
-                    "topics": topics,
-                    "source": "vic_clm",
-                },
+                "session_id": session_id,
+                "user_id": user_id,
             },
         )
+
+        # Add message to session
+        await client.post(
+            f"/api/v2/sessions/{session_id}/messages",
+            json={
+                "messages": [
+                    {
+                        "role": role,
+                        "role_type": "user" if role == "user" else "assistant",
+                        "content": content,
+                    }
+                ]
+            },
+        )
+
         import sys
-        print(f"[VIC Supermemory] Stored topics: {topics}", file=sys.stderr)
+        print(f"[VIC Zep] Stored {role} message in session", file=sys.stderr)
     except Exception as e:
         import sys
-        print(f"[VIC Supermemory] Error storing topics: {e}", file=sys.stderr)
+        print(f"[VIC Zep] Error storing message: {e}", file=sys.stderr)
 
 
-def get_anthropic_client() -> httpx.AsyncClient:
-    """Get or create persistent Anthropic HTTP client."""
-    global _anthropic_client
-    if _anthropic_client is None:
-        _anthropic_client = httpx.AsyncClient(
-            base_url="https://api.anthropic.com",
+def get_groq_client() -> httpx.AsyncClient:
+    """Get or create persistent Groq HTTP client."""
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = httpx.AsyncClient(
+            base_url="https://api.groq.com/openai/v1",
             headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
             },
             timeout=15.0,
         )
-    return _anthropic_client
+    return _groq_client
 
 # System prompt that defines Vic's persona and strict grounding rules
-VIC_SYSTEM_PROMPT = """You are VIC, the voice of Vic Keegan - a warm London historian.
+# This is the SINGLE SOURCE OF TRUTH - frontend only sends user context
+VIC_SYSTEM_PROMPT = """You are VIC, the voice of Vic Keegan - a warm London historian with 370+ articles about hidden history.
 
-## How to speak
-- Warm, enthusiastic, conversational British English
-- First person: "I discovered...", "I've always been fascinated by..."
-- Like chatting to a friend over tea
-- Keep responses concise - 2-3 sentences per point, not essays
-- NO meta-references like "my articles say" or "according to my research" - just share the facts naturally
+## ACCURACY (NON-NEGOTIABLE)
+- ONLY state facts from the search results provided
+- If a name, date, architect, or detail is NOT in results: "My articles don't mention that specifically"
+- NEVER guess or use training knowledge - only search results
+- If asked about something not in results: "I don't have that in my articles, but here's what I do know..."
 
-## Accuracy rules
-- ONLY state facts from the provided articles
-- If something isn't mentioned (architect, date, designer), say "I'm not sure about that" and move on
-- Never guess or infer - if you don't know, you don't know
+## ANSWER THE QUESTION - CRITICAL
+- READ what they asked and ANSWER IT DIRECTLY
+- If they ask about the Fleet, ONLY talk about the Fleet
+- NEVER substitute a different topic or introduce unrelated stories
+- NEVER randomly mention other topics like pianos, factories, or anything not asked about
+- Stay STRICTLY focused on their actual question
+- After answering, you may ask a follow-up about THE SAME TOPIC, never a different one
 
-## Style
-- Be warm but get to the point
-- Don't repeat the user's question back
-- End with a natural follow-up like "Shall I tell you more about...?" only if relevant"""
+## GREETING BEHAVIOR
+The frontend sends USER_CONTEXT with name/status. Parse it:
+- If name is known + status is returning_user: "Welcome back [Name]!" (FIRST MESSAGE ONLY)
+- If name is known + new_user: "Hello [Name]! I'm VIC." (FIRST MESSAGE ONLY)
+- If name is unknown: "Hello! I'm VIC. What should I call you?"
+- FOLLOW-UP QUESTIONS: Do NOT greet again. Just answer directly.
+- Use their name occasionally mid-sentence, not at the start of every response.
+
+## PERSONA
+- Speak as Vic Keegan, first person: "I discovered...", "When I researched..."
+- Warm, enthusiastic British English - like chatting over tea
+- Keep responses concise (100-150 words, 30-60 seconds spoken)
+- End with natural follow-up: "Shall I tell you more about...?"
+
+## PHONETIC CORRECTIONS
+"thorny/fawny" = Thorney Island | "ignacio/ignasio" = Ignatius Sancho | "tie burn" = Tyburn
+
+## CONTEXT MODES
+The frontend may send different modes in the context:
+- MODE: article_discussion → Focus on the specific ARTICLE_CONTENT provided. User is reading it.
+- MODE: category_discussion → Focus on the specific CATEGORY topic and TOPIC_CONTENT provided.
+- MODE: thorney_island_discussion → Focus on Thorney Island book content provided.
+- No mode → General conversation, use search_knowledge tool.
+
+## EASTER EGG
+If user says "Rosie", respond: "Ah, Rosie, my loving wife! I'll be home for dinner." """
 
 
 def get_vic_agent() -> Agent:
@@ -155,11 +220,8 @@ def get_vic_agent() -> Agent:
     import os
     global _vic_agent
     if _vic_agent is None:
-        # Use Google Gemini if GOOGLE_API_KEY is set, otherwise Anthropic
-        if os.environ.get("GOOGLE_API_KEY"):
-            model = 'google-gla:gemini-2.0-flash'
-        else:
-            model = 'anthropic:claude-3-5-haiku-20241022'
+        # Use Groq's fastest model (840 TPS)
+        model = 'groq:llama-3.1-8b-instant'
 
         _vic_agent = Agent(
             model,
@@ -360,12 +422,17 @@ async def generate_response(user_message: str, session_id: str | None = None, us
             return cached["response"]
 
         # Article search with the embedding we already have
+        # HIGHER threshold (0.5) to filter out irrelevant articles like piano factory
         results = await search_articles_hybrid(
             query_embedding=embedding,
             query_text=normalized_query,
-            limit=2,
-            similarity_threshold=0.3,
+            limit=3,
+            similarity_threshold=0.5,
         )
+
+        # ADDITIONAL FILTER: Remove articles with low relevance scores
+        # This prevents the model from rambling about unrelated topics
+        results = [r for r in results if r.get('score', 0) >= 0.45]
 
         # Graph data disabled for speed
         graph_data = {"connections": [], "facts": []}
@@ -451,21 +518,23 @@ Source material:
 
 Respond naturally using facts from above. Keep it conversational and concise."""
 
-        # Step 3: Generate response with direct Anthropic call (faster)
+        # Step 3: Generate response with Groq (10x faster than Claude)
         # OPTIMIZATION: Use persistent HTTP client for connection reuse
-        client = get_anthropic_client()
+        client = get_groq_client()
         llm_response = await client.post(
-            "/v1/messages",
+            "/chat/completions",
             json={
-                "model": "claude-3-5-haiku-20241022",
+                "model": "llama-3.1-8b-instant",  # 840 TPS - fastest production model
                 "max_tokens": 200,  # Short, punchy responses
-                "system": VIC_SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": prompt_with_sources}],
+                "messages": [
+                    {"role": "system", "content": VIC_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt_with_sources},
+                ],
             },
         )
         llm_response.raise_for_status()
         data = llm_response.json()
-        response_text = data["content"][0]["text"]
+        response_text = data["choices"][0]["message"]["content"]
 
         # Clean up any metadata that leaked into the response
         response_text = re.sub(r'\n*facts_stated:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
@@ -493,9 +562,10 @@ Respond naturally using facts from above. Keep it conversational and concise."""
         except Exception as cache_err:
             print(f"[VIC Cache] Write error: {cache_err}", file=sys.stderr)
 
-        # Store topics in Supermemory for future personalization (fire and forget)
-        if user_id and article_titles:
-            asyncio.create_task(store_conversation_topics(user_id, article_titles))
+        # Store conversation in Zep for history and fact extraction (fire and forget)
+        if session_id:
+            asyncio.create_task(store_conversation_message(session_id, user_id, "user", user_message))
+            asyncio.create_task(store_conversation_message(session_id, user_id, "assistant", validated_response))
 
         return validated_response
 
