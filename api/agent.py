@@ -443,9 +443,8 @@ async def generate_response(user_message: str, session_id: str | None = None, us
             similarity_threshold=0.5,
         )
 
-        # ADDITIONAL FILTER: Remove articles with low relevance scores
-        # This prevents the model from rambling about unrelated topics
-        results = [r for r in results if r.get('score', 0) >= 0.45]
+        # NOTE: RRF scores are in 0.01-0.03 range, not 0.0-1.0
+        # No additional filtering needed - RRF already ranks by relevance
 
         # Graph data disabled for speed
         graph_data = {"connections": [], "facts": []}
