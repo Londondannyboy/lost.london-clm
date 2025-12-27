@@ -934,9 +934,15 @@ async def generate_response_with_enrichment(
         # Generate fast response using direct Groq call (faster than agent)
         client = get_groq_client()
 
+        # Check if this is a follow-up (not first message) - don't re-greet
+        is_followup = prior_context.last_response != "" or prior_context.topics_discussed
+
         name_instruction = ""
         if user_name:
-            name_instruction = f"\n\nThe user's name is {user_name}. Use it naturally once, then get into the story."
+            if is_followup:
+                name_instruction = f"\n\nThe user's name is {user_name}. This is a FOLLOW-UP question - do NOT greet them again. Just answer directly."
+            else:
+                name_instruction = f"\n\nThe user's name is {user_name}. Use it naturally once, then get into the story."
         else:
             name_instruction = "\n\nYou don't know the user's name. Don't make one up."
 
