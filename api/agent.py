@@ -636,12 +636,13 @@ TOPIC_CHECK: [the main topic you discussed]"""
             session_id=session_id
         )
 
-        # Return error info in dev mode for debugging
+        # Return error info for debugging - always include error type
         import os
-        if os.environ.get("DEBUG"):
-            return f"Error: {type(e).__name__}: {str(e)[:200]}"
+        # Always return error type to help diagnose issues
+        error_summary = f"{type(e).__name__}: {str(e)[:100]}"
+        print(f"[VIC Agent] Returning error: {error_summary}", file=sys.stderr)
         return (
-            "I'm having a bit of trouble gathering my thoughts on that one. "
+            f"I'm having a bit of trouble gathering my thoughts on that one ({error_summary}). "
             "Could you perhaps ask me in a different way?"
         )
 
