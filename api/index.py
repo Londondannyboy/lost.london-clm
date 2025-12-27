@@ -420,6 +420,52 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.get("/debug/search")
+async def debug_search():
+    """Debug endpoint to test search functionality."""
+    from .tools import get_voyage_embedding, normalize_query
+    from .database import search_articles_hybrid
+    import os
+
+    try:
+        # Test 1: Check DATABASE_URL
+        db_url = os.environ.get("DATABASE_URL", "")
+        db_status = "set" if db_url else "NOT SET"
+
+        # Test 2: Get embedding
+        query = "royal aquarium"
+        normalized = normalize_query(query)
+        embedding = await get_voyage_embedding(normalized)
+
+        # Test 3: Search database
+        results = await search_articles_hybrid(
+            query_embedding=embedding,
+            query_text=normalized,
+            limit=3,
+            similarity_threshold=0.3,
+        )
+
+        return {
+            "status": "ok",
+            "database_url": db_status,
+            "query": query,
+            "normalized": normalized,
+            "embedding_length": len(embedding) if embedding else 0,
+            "results_count": len(results),
+            "results": [
+                {"title": r.get("title", "NO TITLE"), "score": r.get("score", 0)}
+                for r in results[:3]
+            ],
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }
+
+
 # For local development with uvicorn
 if __name__ == "__main__":
     import uvicorn
