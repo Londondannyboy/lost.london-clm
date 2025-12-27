@@ -65,11 +65,12 @@ def create_fast_agent() -> Agent[VICAgentDeps, FastVICResponse]:
     """
     Create the fast-path agent for immediate responses.
 
-    Uses Groq Llama 3.1 (840 TPS) - no tools (search done externally).
+    Uses OpenAI GPT-4o-mini for reliable structured output.
+    Better Pydantic AI support than Groq/Llama.
     Target latency: <2 seconds total.
     """
     return Agent(
-        'groq:llama-3.1-8b-instant',
+        'openai:gpt-4o-mini',
         deps_type=VICAgentDeps,
         result_type=FastVICResponse,
         system_prompt=FAST_SYSTEM_PROMPT,
@@ -77,7 +78,7 @@ def create_fast_agent() -> Agent[VICAgentDeps, FastVICResponse]:
         retries=2,
         model_settings={
             'temperature': 0.7,
-            'max_tokens': 300,  # Slightly more for voice responses
+            'max_tokens': 300,
         },
     )
 
@@ -128,10 +129,13 @@ _enriched_agent: Optional[Agent[VICAgentDeps, EnrichedVICResponse]] = None
 
 
 def get_fast_agent() -> Agent[VICAgentDeps, FastVICResponse]:
-    """Get or create the fast agent singleton."""
+    """Get or create the fast agent singleton.
+
+    Uses OpenAI GPT-4o-mini for reliable structured output.
+    """
     global _fast_agent
-    if _fast_agent is None:
-        _fast_agent = create_fast_agent()
+    # Always create fresh to pick up config changes
+    _fast_agent = create_fast_agent()
     return _fast_agent
 
 

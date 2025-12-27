@@ -984,7 +984,10 @@ You MUST return a JSON with:
 
         except Exception as agent_error:
             # Fallback to direct Groq call if Pydantic AI agent fails
-            print(f"[VIC Agent] Agent failed ({type(agent_error).__name__}), falling back to direct Groq", file=sys.stderr)
+            print(f"[VIC Agent] Agent failed ({type(agent_error).__name__}: {str(agent_error)[:100]}), falling back to direct Groq", file=sys.stderr)
+
+            # Wait a moment before fallback to avoid rate limits
+            await asyncio.sleep(0.5)
 
             client = get_groq_client()
             fallback_prompt = f"""Question: "{user_message}"
