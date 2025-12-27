@@ -16,6 +16,7 @@ import asyncio
 import re
 from uuid import uuid4
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI, Request, Security, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -25,7 +26,7 @@ from openai.types.chat import ChatCompletionChunk
 from openai.types.chat.chat_completion_chunk import Choice, ChoiceDelta
 import tiktoken
 
-from .agent import generate_response
+from .agent import generate_response, generate_response_with_enrichment, get_suggestion_teaser
 from .database import Database
 from .tools import save_user_message
 
@@ -52,7 +53,7 @@ TOPIC_FILLER_PHRASES = [
 ]
 
 
-def extract_topic(user_message: str) -> str | None:
+def extract_topic(user_message: str) -> Optional[str]:
     """Extract a potential topic/subject from the user's message."""
     # Remove common question words
     cleaned = re.sub(
@@ -98,7 +99,7 @@ app.add_middleware(
 )
 
 
-def verify_token(credentials: HTTPAuthorizationCredentials | None) -> bool:
+def verify_token(credentials: Optional[HTTPAuthorizationCredentials]) -> bool:
     """Verify the Bearer token from Hume."""
     if not CLM_AUTH_TOKEN:
         # No token configured - allow all requests (dev mode)
@@ -108,7 +109,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials | None) -> bool:
     return credentials.credentials == CLM_AUTH_TOKEN
 
 
-def extract_user_message(messages: list[dict]) -> str | None:
+def extract_user_message(messages: list[dict]) -> Optional[str]:
     """Extract the last user message from conversation history."""
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -126,7 +127,7 @@ def extract_user_message(messages: list[dict]) -> str | None:
     return None
 
 
-def extract_user_name_from_messages(messages: list[dict]) -> str | None:
+def extract_user_name_from_messages(messages: list[dict]) -> Optional[str]:
     """
     Extract user name from system message if present.
     Looks for patterns like "USER'S NAME: Dan" in the system prompt.
@@ -155,7 +156,7 @@ def extract_user_name_from_messages(messages: list[dict]) -> str | None:
     return None
 
 
-def extract_session_id(request: Request, body: dict | None = None) -> str | None:
+def extract_session_id(request: Request, body: Optional[dict] = None) -> Optional[str]:
     """
     Extract custom_session_id from request.
     Hume may send it in query params, headers, or body.
@@ -194,7 +195,7 @@ def extract_session_id(request: Request, body: dict | None = None) -> str | None
     return None
 
 
-def extract_user_name_from_session(session_id: str | None) -> str | None:
+def extract_user_name_from_session(session_id: Optional[str]) -> Optional[str]:
     """
     Extract user_name from session ID.
     Format: "Name|userId" or just "userId"
@@ -209,7 +210,7 @@ def extract_user_name_from_session(session_id: str | None) -> str | None:
     return None
 
 
-def create_chunk(chunk_id: str, created: int, content: str, session_id: str | None, is_first: bool = False) -> str:
+def create_chunk(chunk_id: str, created: int, content: str, session_id: Optional[str], is_first: bool = False) -> str:
     """Create a single SSE chunk in OpenAI format."""
     chunk = ChatCompletionChunk(
         id=chunk_id,
@@ -231,7 +232,7 @@ def create_chunk(chunk_id: str, created: int, content: str, session_id: str | No
     return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
 
-async def stream_response(text: str, session_id: str | None = None):
+async def stream_response(text: str, session_id: Optional[str] = None):
     """
     Stream response as OpenAI-compatible ChatCompletionChunks.
 
@@ -271,11 +272,15 @@ async def stream_response(text: str, session_id: str | None = None):
 
 async def stream_with_padding(
     user_message: str,
-    session_id: str | None = None,
-    user_name: str | None = None
+    session_id: Optional[str] = None,
+    user_name: Optional[str] = None
 ):
     """
     Stream filler phrases immediately while generating the real response in background.
+
+    Uses dual-path architecture:
+    - Fast path: Immediate response streamed to user
+    - Enrichment path: Background context building for better follow-ups
 
     This improves perceived responsiveness by giving the user immediate feedback
     while the search/validation takes place.
@@ -283,8 +288,11 @@ async def stream_with_padding(
     chunk_id = str(uuid4())
     created = int(time.time())
 
-    # Start generating the real response in the background IMMEDIATELY
-    response_task = asyncio.create_task(generate_response(user_message, session_id, user_name))
+    # Start generating response with enrichment in background IMMEDIATELY
+    # This returns (response_text, enrichment_task) - enrichment runs in background
+    response_task = asyncio.create_task(
+        generate_response_with_enrichment(user_message, session_id, user_name)
+    )
 
     # Choose a filler phrase (topic-aware if we can extract a topic)
     topic = extract_topic(user_message)
@@ -304,14 +312,23 @@ async def stream_with_padding(
     # Add a natural pause (ellipsis already in filler, but add breathing room)
     yield create_chunk(chunk_id, created, " ", session_id)
 
-    # Wait for the real response to complete
-    response_text = await response_task
+    # Wait for the fast response to complete (enrichment continues in background)
+    response_text, enrichment_task = await response_task
 
     # Stream the actual response
     response_tokens = enc.encode(response_text)
     for token_id in response_tokens:
         token_text = enc.decode([token_id])
         yield create_chunk(chunk_id, created, token_text, session_id)
+
+    # Check if enrichment has a suggestion ready (from previous turn)
+    # This adds proactive follow-up suggestions when available
+    suggestion_teaser = get_suggestion_teaser(session_id)
+    if suggestion_teaser:
+        teaser_tokens = enc.encode(suggestion_teaser)
+        for token_id in teaser_tokens:
+            token_text = enc.decode([token_id])
+            yield create_chunk(chunk_id, created, token_text, session_id)
 
     # Send final chunk with finish_reason
     final_chunk = ChatCompletionChunk(
@@ -333,11 +350,14 @@ async def stream_with_padding(
     # Signal end of stream
     yield "data: [DONE]\n\n"
 
+    # Note: enrichment_task continues running in background
+    # It will populate session context for the next query
+
 
 @app.post("/chat/completions")
 async def chat_completions(
     request: Request,
-    credentials: HTTPAuthorizationCredentials | None = Security(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(security),
 ):
     """
     OpenAI-compatible chat completions endpoint for Hume CLM.

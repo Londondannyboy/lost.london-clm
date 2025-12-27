@@ -3,7 +3,7 @@
 import os
 import asyncpg
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -11,7 +11,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 class Database:
     """Async database connection manager for Neon PostgreSQL."""
 
-    _pool: asyncpg.Pool | None = None
+    _pool: Optional[asyncpg.Pool] = None
 
     @classmethod
     async def get_pool(cls) -> asyncpg.Pool:
@@ -140,7 +140,7 @@ async def search_articles_hybrid(
         return [dict(r) for r in results]
 
 
-async def get_cached_response(query: str) -> dict | None:
+async def get_cached_response(query: str) -> Optional[dict]:
     """
     Check if we have a cached response for this query or its variations.
 

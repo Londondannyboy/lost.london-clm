@@ -1,23 +1,83 @@
-"""Pydantic AI agent for VIC - the voice of Vic Keegan."""
+"""Pydantic AI agent for VIC - the voice of Vic Keegan.
+
+Dual-path architecture:
+- Fast path: Immediate response within 2 seconds
+- Enrichment path: Background context building for better follow-ups
+"""
 
 import os
+import asyncio
 import httpx
 from pydantic_ai import Agent
 from pydantic import ValidationError
+from typing import Optional, Tuple
+from dataclasses import dataclass, field
 
-from .models import ValidatedVICResponse, DeclinedResponse, SearchResults
+from .models import (
+    ValidatedVICResponse,
+    DeclinedResponse,
+    SearchResults,
+    FastVICResponse,
+    EnrichedVICResponse,
+    ExtractedEntity,
+    EntityConnection,
+    SuggestedTopic,
+)
 from .tools import search_articles, get_user_memory
+from .agent_deps import VICAgentDeps
+from .agent_config import get_fast_agent, get_enriched_agent, VIC_SYSTEM_PROMPT
 
-# Lazy-loaded agent instance
-_vic_agent: Agent | None = None
+# Lazy-loaded agent instance (legacy)
+_vic_agent: Optional[Agent] = None
+
+
+# =============================================================================
+# Session Context Store - In-memory storage for enrichment data
+# =============================================================================
+
+@dataclass
+class SessionContext:
+    """Enrichment context for a conversation session."""
+    entities: list[ExtractedEntity] = field(default_factory=list)
+    connections: list[EntityConnection] = field(default_factory=list)
+    suggestions: list[SuggestedTopic] = field(default_factory=list)
+    topics_discussed: list[str] = field(default_factory=list)
+    last_response: str = ""
+    enrichment_complete: bool = False
+
+
+# LRU-style session store (max 100 sessions)
+_session_contexts: dict[str, SessionContext] = {}
+MAX_SESSIONS = 100
+
+
+def get_session_context(session_id: Optional[str]) -> SessionContext:
+    """Get or create session context."""
+    if not session_id:
+        return SessionContext()
+
+    if session_id not in _session_contexts:
+        # Evict oldest if at capacity
+        if len(_session_contexts) >= MAX_SESSIONS:
+            oldest_key = next(iter(_session_contexts))
+            del _session_contexts[oldest_key]
+        _session_contexts[session_id] = SessionContext()
+
+    return _session_contexts[session_id]
+
+
+def update_session_context(session_id: Optional[str], context: SessionContext) -> None:
+    """Update session context after enrichment."""
+    if session_id:
+        _session_contexts[session_id] = context
 
 # OPTIMIZATION: Persistent HTTP client for Groq API (connection reuse)
-_groq_client: httpx.AsyncClient | None = None
+_groq_client: Optional[httpx.AsyncClient] = None
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 # Zep for user memory and conversation history
 ZEP_API_KEY = os.environ.get("ZEP_API_KEY", "")
-_zep_client: httpx.AsyncClient | None = None
+_zep_client: Optional[httpx.AsyncClient] = None
 
 
 def get_zep_client() -> httpx.AsyncClient:
@@ -35,7 +95,7 @@ def get_zep_client() -> httpx.AsyncClient:
     return _zep_client
 
 
-async def get_user_memory_context(user_id: str | None) -> str:
+async def get_user_memory_context(user_id: Optional[str]) -> str:
     """Fetch user's memory profile from Zep knowledge graph."""
     if not user_id or not ZEP_API_KEY:
         return ""
@@ -84,7 +144,7 @@ async def get_user_memory_context(user_id: str | None) -> str:
         return ""
 
 
-async def get_conversation_history(session_id: str | None) -> list[dict]:
+async def get_conversation_history(session_id: Optional[str]) -> list[dict]:
     """Fetch recent conversation history from Zep threads."""
     if not session_id or not ZEP_API_KEY:
         return []
@@ -115,7 +175,7 @@ async def get_conversation_history(session_id: str | None) -> list[dict]:
         return []
 
 
-async def store_conversation_message(session_id: str | None, user_id: str | None, role: str, content: str) -> None:
+async def store_conversation_message(session_id: Optional[str], user_id: Optional[str], role: str, content: str) -> None:
     """Store conversation message in Zep for history and fact extraction."""
     if not session_id or not ZEP_API_KEY:
         return
@@ -310,7 +370,7 @@ async def log_validation(
     validation_notes: str,
     response_text: str,
     confidence_score: float,
-    session_id: str | None
+    session_id: Optional[str]
 ) -> None:
     """Log validation details to database for debugging."""
     try:
@@ -349,7 +409,7 @@ def extract_facts_from_response(response: str) -> list[str]:
     return facts[:10]  # Limit to 10 facts
 
 
-async def detect_and_store_correction(user_message: str, user_name: str | None, session_id: str | None) -> bool:
+async def detect_and_store_correction(user_message: str, user_name: Optional[str], session_id: Optional[str]) -> bool:
     """
     Detect if the user is making a correction and store it.
     Returns True if a correction was detected and stored.
@@ -388,7 +448,7 @@ async def detect_and_store_correction(user_message: str, user_name: str | None, 
     return False
 
 
-async def generate_response(user_message: str, session_id: str | None = None, user_name: str | None = None) -> str:
+async def generate_response(user_message: str, session_id: Optional[str] = None, user_name: Optional[str] = None) -> str:
     """
     Generate a validated response to the user's message.
     OPTIMIZED for speed - parallel operations, skip slow enrichment.
@@ -685,3 +745,269 @@ Based ONLY on the above articles, respond as Vic Keegan. Remember:
     agent = get_vic_agent()
     result = await agent.run(focused_prompt)
     return result.data
+
+
+# =============================================================================
+# Dual-Path Agent Architecture
+# =============================================================================
+
+
+async def run_enrichment(
+    user_message: str,
+    fast_response: str,
+    session_id: Optional[str],
+    user_id: Optional[str],
+    source_content: str,
+    source_titles: list[str],
+) -> SessionContext:
+    """
+    Run background enrichment to build context for follow-up queries.
+
+    Extracts entities, traverses the knowledge graph, and generates
+    follow-up suggestions. Results are stored in session context.
+
+    Args:
+        user_message: The original user query
+        fast_response: The fast path response we gave
+        session_id: Session ID for context storage
+        user_id: User ID for personalization
+        source_content: Combined article content used
+        source_titles: Titles of articles used
+
+    Returns:
+        Updated SessionContext with enrichment data
+    """
+    import sys
+    from .tools import (
+        extract_entities,
+        traverse_graph_connections,
+        suggest_followup_topics,
+    )
+    from pydantic_ai import RunContext
+
+    context = get_session_context(session_id)
+
+    try:
+        # Create deps for tool context
+        deps = VICAgentDeps(
+            user_id=user_id,
+            session_id=session_id,
+            enrichment_mode=True,
+            prior_entities=[e.name for e in context.entities],
+            prior_topics=context.topics_discussed,
+        )
+
+        # Create a mock RunContext for tools
+        # Note: In production, these would be called by the agent
+        class MockRunContext:
+            def __init__(self, deps):
+                self.deps = deps
+
+        mock_ctx = MockRunContext(deps)
+
+        # Step 1: Extract entities from source content
+        print(f"[Enrichment] Extracting entities from {len(source_titles)} articles", file=sys.stderr)
+        all_entities: list[ExtractedEntity] = []
+        for title in source_titles[:2]:  # Limit to top 2 articles
+            entities = await extract_entities(mock_ctx, source_content, title)
+            all_entities.extend(entities)
+
+        # Deduplicate entities
+        seen_names = set()
+        unique_entities = []
+        for e in all_entities:
+            if e.name.lower() not in seen_names:
+                seen_names.add(e.name.lower())
+                unique_entities.append(e)
+        context.entities = unique_entities[:10]
+
+        print(f"[Enrichment] Found {len(context.entities)} unique entities", file=sys.stderr)
+
+        # Step 2: Traverse graph for connections (if we have entities)
+        if context.entities:
+            # Use the first significant entity
+            start_entity = context.entities[0].name
+            print(f"[Enrichment] Traversing graph from '{start_entity}'", file=sys.stderr)
+            connections = await traverse_graph_connections(mock_ctx, start_entity, max_depth=2)
+            context.connections = connections[:10]
+            print(f"[Enrichment] Found {len(context.connections)} connections", file=sys.stderr)
+
+        # Step 3: Generate follow-up suggestions
+        entity_names = [e.name for e in context.entities]
+        current_topic = source_titles[0] if source_titles else user_message
+        print(f"[Enrichment] Generating suggestions for '{current_topic}'", file=sys.stderr)
+        suggestions = await suggest_followup_topics(mock_ctx, current_topic, entity_names)
+        context.suggestions = suggestions
+        print(f"[Enrichment] Generated {len(context.suggestions)} suggestions", file=sys.stderr)
+
+        # Update context
+        context.topics_discussed.append(current_topic)
+        context.last_response = fast_response
+        context.enrichment_complete = True
+
+        # Save to session store
+        update_session_context(session_id, context)
+
+        print(f"[Enrichment] Complete for session {session_id}", file=sys.stderr)
+
+    except Exception as e:
+        print(f"[Enrichment] Error: {e}", file=sys.stderr)
+        # Enrichment failure is non-critical - don't affect main flow
+
+    return context
+
+
+async def generate_response_with_enrichment(
+    user_message: str,
+    session_id: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> tuple[str, Optional[asyncio.Task]]:
+    """
+    Generate response using dual-path architecture.
+
+    Fast path delivers immediate response, enrichment runs in background.
+
+    Args:
+        user_message: The user's question
+        session_id: Session ID for context
+        user_name: User's name for personalization
+
+    Returns:
+        Tuple of (response_text, enrichment_task)
+        The enrichment_task can be awaited later or ignored.
+    """
+    from .tools import normalize_query, get_voyage_embedding
+    from .database import search_articles_hybrid
+    import sys
+
+    # Check for prior enriched context
+    prior_context = get_session_context(session_id)
+
+    # If we have prior context with suggestions, we can use it to enhance the response
+    context_enhancement = ""
+    if prior_context.enrichment_complete and prior_context.entities:
+        entity_names = [e.name for e in prior_context.entities[:5]]
+        context_enhancement = f"\n\nPrior context - entities discussed: {', '.join(entity_names)}"
+        print(f"[VIC Agent] Using prior context with {len(prior_context.entities)} entities", file=sys.stderr)
+
+    # Extract user_id from session_id
+    user_id = None
+    if session_id:
+        if '|' in session_id:
+            user_id = session_id.split('|')[1].split('_')[0]
+        else:
+            user_id = session_id.split('_')[0]
+
+    try:
+        # Fast path: Search + LLM response
+        normalized_query = normalize_query(user_message)
+        embedding = await get_voyage_embedding(normalized_query)
+
+        results = await search_articles_hybrid(
+            query_embedding=embedding,
+            query_text=normalized_query,
+            limit=5,
+            similarity_threshold=0.3,
+        )
+
+        if not results:
+            return (
+                "I don't seem to have any articles about that in my collection. "
+                "Is there something else about London's history I can help you with?",
+                None
+            )
+
+        # Prepare source content
+        source_content = "\n\n---\n\n".join(
+            f"**{r['title']}**\n{r['content']}"
+            for r in results
+        )
+        source_titles = [r['title'] for r in results]
+
+        # Generate fast response using direct Groq call (faster than agent)
+        client = get_groq_client()
+
+        name_instruction = ""
+        if user_name:
+            name_instruction = f"\n\nThe user's name is {user_name}. Use it naturally once, then get into the story."
+        else:
+            name_instruction = "\n\nYou don't know the user's name. Don't make one up."
+
+        prompt = f"""Question: "{user_message}"
+{name_instruction}
+{context_enhancement}
+
+Source material:
+{source_content}
+
+Respond naturally using facts from above. Keep it conversational and under 150 words."""
+
+        llm_response = await client.post(
+            "/chat/completions",
+            json={
+                "model": "llama-3.1-8b-instant",
+                "max_tokens": 250,
+                "messages": [
+                    {"role": "system", "content": VIC_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+        )
+        llm_response.raise_for_status()
+        data = llm_response.json()
+        response_text = data["choices"][0]["message"]["content"]
+
+        # Clean up response
+        import re
+        response_text = re.sub(r'\n*TOPIC_CHECK:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
+        response_text = response_text.strip()
+
+        # Post-validate
+        validated_response = post_validate_response(response_text, source_content)
+
+        # Start enrichment in background (non-blocking)
+        enrichment_task = asyncio.create_task(
+            run_enrichment(
+                user_message=user_message,
+                fast_response=validated_response,
+                session_id=session_id,
+                user_id=user_id,
+                source_content=source_content,
+                source_titles=source_titles,
+            )
+        )
+
+        # Store conversation in Zep (fire and forget)
+        if session_id:
+            asyncio.create_task(store_conversation_message(session_id, user_id, "user", user_message))
+            asyncio.create_task(store_conversation_message(session_id, user_id, "assistant", validated_response))
+
+        return validated_response, enrichment_task
+
+    except Exception as e:
+        import traceback
+        error_msg = f"[VIC Agent Error] {type(e).__name__}: {e}"
+        print(error_msg, file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+
+        return (
+            f"I'm having a bit of trouble gathering my thoughts on that one ({type(e).__name__}). "
+            "Could you perhaps ask me in a different way?",
+            None
+        )
+
+
+def get_suggestion_teaser(session_id: Optional[str]) -> Optional[str]:
+    """
+    Get a follow-up suggestion teaser if enrichment has completed.
+
+    Call this after streaming the main response to append a suggestion.
+    """
+    context = get_session_context(session_id)
+
+    if context.enrichment_complete and context.suggestions:
+        # Get top suggestion
+        top = context.suggestions[0]
+        return f" {top.teaser}"
+
+    return None
