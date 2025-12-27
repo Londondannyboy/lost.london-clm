@@ -26,7 +26,17 @@ from openai.types.chat import ChatCompletionChunk
 from openai.types.chat.chat_completion_chunk import Choice, ChoiceDelta
 import tiktoken
 
-from .agent import generate_response, generate_response_with_enrichment, get_suggestion_teaser
+from .agent import (
+    generate_response,
+    generate_response_with_enrichment,
+    get_suggestion_teaser,
+    should_use_name,
+    mark_name_used,
+    increment_turn_counter,
+    is_affirmation,
+    get_last_suggestion,
+    set_last_suggestion,
+)
 from .database import Database
 from .tools import save_user_message
 
@@ -121,7 +131,11 @@ def verify_token(credentials: Optional[HTTPAuthorizationCredentials]) -> bool:
 
 
 def extract_user_message(messages: list[dict]) -> Optional[str]:
-    """Extract the last user message from conversation history."""
+    """Extract the last user message from conversation history.
+
+    Returns None if the most recent user message is silence or a system instruction,
+    to prevent responding to old messages.
+    """
     for msg in reversed(messages):
         if msg.get("role") == "user":
             content = msg.get("content", "")
@@ -135,9 +149,15 @@ def extract_user_message(messages: list[dict]) -> Optional[str]:
                 ]
                 content = " ".join(text_parts)
 
-            # Skip Hume instruction messages (not actual user queries)
+            # If the most recent user message is silence, return None
+            # Don't fall back to earlier messages (that causes repetition)
+            if content and content.lower().strip() == "[user silent]":
+                return None
+
+            # If the most recent user message is a greeting instruction, return None
+            # The greeting handler will catch this case separately
             if content and content.lower().startswith("speak your greeting"):
-                continue
+                return None
 
             # Strip Hume emotion tags like {very interested, quite contemplative}
             if content and "{" in content:
@@ -335,6 +355,25 @@ async def stream_with_padding(
     # Wait for the fast response to complete (enrichment continues in background)
     response_text, enrichment_task = await response_task
 
+    # Extract any suggested topic from the response and store it
+    # Patterns: "Would you like to hear about X?" "Shall I tell you about X?"
+    import re
+    suggestion_patterns = [
+        r"would you like to hear (?:more )?about ([^?]+)\?",
+        r"shall i tell you (?:more )?about ([^?]+)\?",
+        r"would you like to know (?:more )?about ([^?]+)\?",
+        r"i could tell you about ([^?.,]+)",
+        r"there's quite a story (?:about|there) ([^?.,]+)",
+    ]
+    for pattern in suggestion_patterns:
+        match = re.search(pattern, response_text.lower())
+        if match:
+            suggested_topic = match.group(1).strip()
+            set_last_suggestion(session_id, suggested_topic)
+            import sys
+            print(f"[VIC CLM] Stored suggestion for next turn: '{suggested_topic}'", file=sys.stderr)
+            break
+
     # Stream the actual response
     response_tokens = enc.encode(response_text)
     for token_id in response_tokens:
@@ -446,41 +485,80 @@ async def chat_completions(
     # Use the already extracted user message
     user_message = user_message_extracted
 
-    # Check if this is a greeting request (Hume sends "Speak your greeting")
-    is_greeting_request = any(
-        m.get("role") == "user" and
-        isinstance(m.get("content"), str) and
-        m.get("content", "").lower().startswith("speak your greeting")
-        for m in messages
-    ) and not user_message
+    # Check if this is a greeting request by looking at the MOST RECENT user message only
+    # (not any message in history - that caused greeting loops)
+    most_recent_user_content = None
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                most_recent_user_content = content.lower().strip()
+            break
+
+    is_greeting_request = (
+        most_recent_user_content is not None and
+        most_recent_user_content.startswith("speak your greeting")
+    )
 
     if is_greeting_request:
-        # Generate a proper greeting
+        # Generate a proper greeting - warm and conversational, like Vic chatting over tea
+        # Avoid exclamation marks - they make the TTS sound too excited/different
         if user_name:
-            greeting = f"Hello {user_name}! Wonderful to see you. I'm Vic, and I've got over 370 stories about London's hidden history to share with you. What would you like to explore today?"
+            greeting = f"Ah, hello {user_name}. Good to have you here. I'm Vic, and I've collected over 370 stories about London's hidden history. What corner of the city shall we explore together?"
+            mark_name_used(session_id, is_greeting=True)
         else:
-            greeting = "Hello! I'm Vic, the voice of Vic Keegan. I've got over 370 stories about London's hidden history to share with you. What should I call you, and what would you like to explore?"
+            greeting = "Ah, hello there. I'm Vic, the voice of Vic Keegan. I've spent years uncovering London's hidden stories, and I'd love to share them with you. What should I call you, and where shall we begin?"
         return StreamingResponse(
             stream_response(greeting, session_id),
             media_type="text/event-stream",
         )
 
     if not user_message:
-        # No user message - return a prompt
-        fallback = "I didn't quite catch that. Could you say that again?"
-        return StreamingResponse(
-            stream_response(fallback, session_id),
-            media_type="text/event-stream",
-        )
+        # No user message (silence) - return 204 No Content
+        # This tells Hume there's nothing to process, preventing restart loops
+        import sys
+        print(f"[VIC CLM] No user message found (silence), returning 204 No Content", file=sys.stderr)
+        from fastapi.responses import Response
+        return Response(status_code=204)
+
+    # Check if this is an affirmation of a previous suggestion
+    # e.g., user says "yes" after VIC asked "Would you like to hear about X?"
+    actual_query = user_message
+    is_affirm, topic_hint = is_affirmation(user_message)
+
+    if is_affirm:
+        import sys
+        if topic_hint:
+            # User said something like "yeah, the Thames" - use their topic hint
+            print(f"[VIC CLM] Affirmation with topic hint: '{topic_hint}'", file=sys.stderr)
+            actual_query = topic_hint
+        else:
+            # Pure affirmation like "yes" - use last suggestion
+            last_suggestion = get_last_suggestion(session_id)
+            if last_suggestion:
+                print(f"[VIC CLM] Pure affirmation '{user_message}' -> using last suggestion: '{last_suggestion}'", file=sys.stderr)
+                actual_query = last_suggestion
+            else:
+                print(f"[VIC CLM] Affirmation detected but no last suggestion stored", file=sys.stderr)
 
     # Save user message to memory (fire and forget)
     if session_id:
         asyncio.create_task(save_user_message(session_id, user_message, "user"))
 
+    # Check if we should use the name in this response (spacing rule)
+    use_name = should_use_name(session_id, is_greeting=False)
+    effective_name = user_name if use_name else None
+
+    if use_name and user_name:
+        mark_name_used(session_id)
+
+    # Always increment turn counter for tracking
+    increment_turn_counter(session_id)
+
     # OPTIMIZATION: Stream filler phrases while generating response
     # This disguises the delay and makes VIC feel more responsive
     return StreamingResponse(
-        stream_with_padding(user_message, session_id, user_name),
+        stream_with_padding(actual_query, session_id, effective_name),
         media_type="text/event-stream",
     )
 

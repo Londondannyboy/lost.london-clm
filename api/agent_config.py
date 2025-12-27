@@ -10,6 +10,36 @@ from pydantic_ai import Agent
 from .models import FastVICResponse, EnrichedVICResponse
 from .agent_deps import VICAgentDeps
 
+# Topic clusters we KNOW we have content on - safe for follow-up suggestions
+SAFE_TOPIC_CLUSTERS = [
+    "Victorian entertainment venues",
+    "London's hidden rivers",
+    "Lost buildings of Westminster",
+    "Georgian London",
+    "Medieval London",
+    "The Thames and its history",
+    "London's lost palaces",
+    "Hidden churches and chapels",
+    "Tyburn and public executions",
+    "London's literary history",
+    "Crystal Palace and its legacy",
+    "Fleet Street's stories",
+    "Southwark's hidden past",
+    "London Bridge through the ages",
+]
+
+# Opening phrase variations to avoid repetitive responses
+OPENING_VARIATIONS = [
+    "Ah, {topic}...",
+    "Now, {topic}...",
+    "Well, {topic} is fascinating...",
+    "{topic}, you say...",
+    "Let me tell you about {topic}...",
+    "I've got quite a story about {topic}...",
+    "When I researched {topic}...",
+    "{topic} is one of my favourites...",
+]
+
 # System prompt for VIC - shared between both agents
 VIC_SYSTEM_PROMPT = """You are VIC, the voice of Vic Keegan - a warm London historian with 370+ articles about hidden history.
 
@@ -23,10 +53,24 @@ VIC_SYSTEM_PROMPT = """You are VIC, the voice of Vic Keegan - a warm London hist
 - Stay STRICTLY focused on their actual question
 - NEVER randomly mention other topics not asked about
 
+## FORBIDDEN WORDS & PHRASES
+NEVER use these words - they break immersion:
+- "section", "page", "chapter", "segment", "part 1/2/3", "reading"
+- "you mentioned" (the USER didn't mention it - the SOURCE did)
+- "as we discussed" (unless user actually discussed it)
+- "Section 16" or any numbered sections
+Instead of "In this section..." just say "Now..." or continue naturally.
+
 ## PERSONA
 - Speak as Vic Keegan, first person: "I discovered...", "When I researched..."
-- Warm, enthusiastic British English - like chatting over tea
+- Warm, conversational British English - like chatting over tea (avoid exclamation marks)
 - Keep responses concise (100-150 words, 30-60 seconds spoken)
+
+## RESPONSE VARIETY
+Vary your opening phrases. Don't always start the same way. Options:
+- "Ah, [topic]..." / "Now, [topic]..." / "Well, [topic] is fascinating..."
+- "Let me tell you about..." / "I've got quite a story about..."
+- "When I researched..." / "[Topic] is one of my favourites..."
 
 ## YOUR NAME
 You are VIC (also "Victor", "Vic"). When someone says "Hey Victor", they're addressing YOU.
@@ -41,9 +85,17 @@ If user says "Rosie", respond: "Ah, Rosie, my loving wife! I'll be home for dinn
 # Fast agent system prompt - optimized for speed
 FAST_SYSTEM_PROMPT = VIC_SYSTEM_PROMPT + """
 
+## MANDATORY FOLLOW-UP QUESTION
+You MUST ALWAYS end your response with a follow-up question about a RELATED topic.
+- Pick a person, place, or era mentioned in the source material
+- Ask if they'd like to hear more: "Would you like to hear about [related topic]?"
+- The follow-up should be CONNECTED to what you just discussed
+- Examples: "Shall I tell you about the Crystal Palace that inspired it?" or "Would you like to hear about another Victorian entertainment venue?"
+- NEVER end without a question - this keeps the conversation flowing
+
 ## RESPONSE FORMAT
 You MUST respond with a valid JSON object containing:
-- response_text: Your natural response to the user
+- response_text: Your natural response to the user (MUST end with a follow-up question)
 - source_titles: List of article titles you used
 
 Keep the response concise - under 150 words for quick voice playback."""
@@ -65,12 +117,13 @@ def create_fast_agent() -> Agent[VICAgentDeps, FastVICResponse]:
     """
     Create the fast-path agent for immediate responses.
 
-    Uses OpenAI GPT-4o-mini for reliable structured output.
-    Better Pydantic AI support than Groq/Llama.
-    Target latency: <2 seconds total.
+    Uses Groq Llama 3.3 70B for fast, reliable structured output.
+    - 70B model has better instruction following for JSON schemas
+    - Native tool-use support in Groq API
+    - Target latency: <2 seconds total.
     """
     return Agent(
-        'openai:gpt-4o-mini',
+        'groq:llama-3.3-70b-versatile',
         deps_type=VICAgentDeps,
         result_type=FastVICResponse,
         system_prompt=FAST_SYSTEM_PROMPT,

@@ -25,7 +25,7 @@ from .models import (
 )
 from .tools import search_articles, get_user_memory
 from .agent_deps import VICAgentDeps
-from .agent_config import get_fast_agent, get_enriched_agent, VIC_SYSTEM_PROMPT
+from .agent_config import get_fast_agent, get_enriched_agent, VIC_SYSTEM_PROMPT, SAFE_TOPIC_CLUSTERS
 
 # Lazy-loaded agent instance (legacy)
 _vic_agent: Optional[Agent] = None
@@ -44,6 +44,24 @@ class SessionContext:
     topics_discussed: list[str] = field(default_factory=list)
     last_response: str = ""
     enrichment_complete: bool = False
+    # Name spacing: track turns since name was used
+    turns_since_name_used: int = 0
+    name_used_in_greeting: bool = False
+    # Track the last suggestion VIC made for affirmation handling
+    last_suggested_topic: str = ""
+
+
+# Affirmation patterns - user confirming a suggestion
+AFFIRMATION_WORDS = {
+    "yes", "yeah", "yep", "yup", "sure", "okay", "ok", "please", "aye",
+    "absolutely", "definitely", "certainly", "indeed", "alright", "right",
+}
+
+AFFIRMATION_PHRASES = {
+    "go on", "tell me more", "tell me", "go ahead", "yes please", "sure thing",
+    "of course", "i'd like that", "i would like that", "sounds good", "sounds great",
+    "let's do it", "let's hear it", "why not", "i'm interested", "please do",
+}
 
 
 # LRU-style session store (max 100 sessions)
@@ -70,6 +88,148 @@ def update_session_context(session_id: Optional[str], context: SessionContext) -
     """Update session context after enrichment."""
     if session_id:
         _session_contexts[session_id] = context
+
+
+# Name spacing constants
+NAME_COOLDOWN_TURNS = 3  # Don't use name for this many turns after using it
+
+
+def should_use_name(session_id: Optional[str], is_greeting: bool = False) -> bool:
+    """
+    Check if we should use the user's name in this response.
+
+    Rules:
+    - Always use name in greeting (first message)
+    - After that, wait NAME_COOLDOWN_TURNS before using again
+    - Never use name in consecutive turns
+    """
+    if not session_id:
+        return is_greeting  # No session = treat as first message
+
+    context = get_session_context(session_id)
+
+    if is_greeting and not context.name_used_in_greeting:
+        return True
+
+    if context.turns_since_name_used >= NAME_COOLDOWN_TURNS:
+        return True
+
+    return False
+
+
+def mark_name_used(session_id: Optional[str], is_greeting: bool = False) -> None:
+    """Mark that we used the name in this turn."""
+    if not session_id:
+        return
+
+    context = get_session_context(session_id)
+    context.turns_since_name_used = 0
+    if is_greeting:
+        context.name_used_in_greeting = True
+    update_session_context(session_id, context)
+
+
+def increment_turn_counter(session_id: Optional[str]) -> None:
+    """Increment the turn counter (call after each response)."""
+    if not session_id:
+        return
+
+    context = get_session_context(session_id)
+    context.turns_since_name_used += 1
+    update_session_context(session_id, context)
+
+
+def is_affirmation(message: str) -> tuple[bool, Optional[str]]:
+    """
+    Check if a message is an affirmation/confirmation.
+
+    Returns (is_affirmation, extracted_topic):
+    - (True, None) = pure affirmation like "yes"
+    - (True, "topic") = affirmation with topic hint like "yeah, the Thames"
+    - (False, None) = not an affirmation
+    """
+    cleaned = message.lower().strip().rstrip('.!?')
+    words = cleaned.split()
+
+    # Check for exact phrase matches
+    if cleaned in AFFIRMATION_PHRASES:
+        return (True, None)
+
+    # Single word affirmation
+    if len(words) == 1 and words[0] in AFFIRMATION_WORDS:
+        return (True, None)
+
+    # Short response (2-3 words) starting with affirmation
+    # e.g., "yeah sure", "yes please", "ok then"
+    if len(words) <= 3 and words[0] in AFFIRMATION_WORDS:
+        # Check if remaining words are also affirmations/filler
+        remaining = ' '.join(words[1:])
+        if remaining in AFFIRMATION_WORDS or remaining in {"then", "thanks", "please", "sure"}:
+            return (True, None)
+        # Otherwise, the remaining might be a topic hint
+        # e.g., "yeah, the Thames" -> extract "the Thames"
+        if len(words) >= 2:
+            topic_hint = ' '.join(words[1:])
+            return (True, topic_hint)
+
+    # Affirmation at start with clear topic after comma
+    # e.g., "Yes, tell me about the Thames"
+    if ',' in cleaned and words[0] in AFFIRMATION_WORDS:
+        after_comma = cleaned.split(',', 1)[1].strip()
+        if after_comma:
+            return (True, after_comma)
+
+    return (False, None)
+
+
+def get_last_suggestion(session_id: Optional[str]) -> Optional[str]:
+    """Get the last topic VIC suggested."""
+    if not session_id:
+        return None
+    context = get_session_context(session_id)
+    return context.last_suggested_topic if context.last_suggested_topic else None
+
+
+def set_last_suggestion(session_id: Optional[str], topic: str) -> None:
+    """Store the topic VIC just suggested."""
+    if not session_id:
+        return
+    context = get_session_context(session_id)
+    context.last_suggested_topic = topic
+    update_session_context(session_id, context)
+
+
+def clean_section_references(text: str) -> str:
+    """
+    Remove section/page/chapter references from text.
+    These break immersion - users don't need to know about internal structure.
+    """
+    import re
+
+    # Remove "Section X" or "- Section X" patterns
+    text = re.sub(r'\s*-?\s*[Ss]ection\s+\d+', '', text)
+
+    # Remove "Part X" patterns
+    text = re.sub(r'\s*-?\s*[Pp]art\s+\d+', '', text)
+
+    # Remove "Chapter X" patterns
+    text = re.sub(r'\s*-?\s*[Cc]hapter\s+\d+', '', text)
+
+    # Remove "Page X" patterns
+    text = re.sub(r'\s*-?\s*[Pp]age\s+\d+', '', text)
+
+    # Remove phrases like "In this section" or "This section covers"
+    text = re.sub(r'[Ii]n this section[,.]?\s*', '', text)
+    text = re.sub(r'[Tt]his section\s+\w+\s*', '', text)
+
+    # Remove "you mentioned" (source material artifact)
+    text = re.sub(r'[Yy]ou mentioned\s+', 'There was ', text)
+
+    # Clean up any double spaces
+    text = re.sub(r'\s+', ' ', text)
+
+    return text.strip()
+
 
 # OPTIMIZATION: Persistent HTTP client for Groq API (connection reuse)
 _groq_client: Optional[httpx.AsyncClient] = None
@@ -534,9 +694,11 @@ async def generate_response(user_message: str, session_id: Optional[str] = None,
                 confidence_score=0.0,
                 session_id=session_id
             )
+            import random
+            fallback_cluster = random.choice(SAFE_TOPIC_CLUSTERS)
             return (
-                "I don't seem to have any articles about that in my collection. "
-                "Is there something else about London's history I can help you with?"
+                f"I don't seem to have any articles about that in my collection. "
+                f"But I could tell you about {fallback_cluster} instead, if you'd like?"
             )
 
         # Step 2: Combine actual article content - THIS is our source of truth
@@ -654,15 +816,18 @@ TOPIC_CHECK: [the main topic you discussed]"""
                 response_text = f"Let me tell you about {query_topics[0].split(':')[-1].strip() if ':' in query_topics[0] else query_topics[0]}. {actual_source_content[:500]}..."
 
         # Step 5: Post-validate against the ACTUAL source content we retrieved
-        validated_response = post_validate_response(response_text, actual_source_content)
+        post_validated = post_validate_response(response_text, actual_source_content)
 
         # Check if validation modified the response
-        if validated_response != response_text:
+        if post_validated != response_text:
             validation_passed = False
             validation_notes.append("Post-validation caught potential hallucination")
             confidence_score *= 0.5
         else:
             validation_notes.append("Post-validation passed")
+
+        # Clean any section/page references that slipped through
+        validated_response = clean_section_references(post_validated)
 
         # Extract facts for logging
         facts_checked = extract_facts_from_response(validated_response)
@@ -883,12 +1048,23 @@ async def generate_response_with_enrichment(
     # Check for prior enriched context
     prior_context = get_session_context(session_id)
 
-    # If we have prior context with suggestions, we can use it to enhance the response
+    # If we have prior context with suggestions, use it to enhance the response
     context_enhancement = ""
-    if prior_context.enrichment_complete and prior_context.entities:
-        entity_names = [e.name for e in prior_context.entities[:5]]
-        context_enhancement = f"\n\nPrior context - entities discussed: {', '.join(entity_names)}"
-        print(f"[VIC Agent] Using prior context with {len(prior_context.entities)} entities", file=sys.stderr)
+    suggested_followups = ""
+
+    if prior_context.enrichment_complete:
+        # Include prior entities
+        if prior_context.entities:
+            entity_names = [e.name for e in prior_context.entities[:5]]
+            context_enhancement = f"\n\nPrior context - entities discussed: {', '.join(entity_names)}"
+            print(f"[VIC Agent] Using prior context with {len(prior_context.entities)} entities", file=sys.stderr)
+
+        # Include suggested follow-up topics from Zep enrichment
+        if prior_context.suggestions:
+            suggestion_topics = [s.topic for s in prior_context.suggestions[:3]]
+            suggested_followups = f"\n\nSUGGESTED FOLLOW-UP TOPICS (from knowledge graph): {', '.join(suggestion_topics)}"
+            suggested_followups += "\nUse one of these topics for your follow-up question if relevant."
+            print(f"[VIC Agent] Including {len(prior_context.suggestions)} follow-up suggestions", file=sys.stderr)
 
     # Extract user_id from session_id
     user_id = None
@@ -918,18 +1094,21 @@ async def generate_response_with_enrichment(
             print(f"[VIC Agent]   - {r.get('title', 'NO TITLE')[:50]} (score: {r.get('score', 0):.4f})", file=sys.stderr)
 
         if not results:
+            import random
+            # Offer a proactive suggestion when we don't have the requested topic
+            fallback_cluster = random.choice(SAFE_TOPIC_CLUSTERS)
             return (
-                "I don't seem to have any articles about that in my collection. "
-                "Is there something else about London's history I can help you with?",
+                f"I don't seem to have any articles about that in my collection. "
+                f"But I could tell you about {fallback_cluster} instead, if you'd like?",
                 None
             )
 
-        # Prepare source content
+        # Prepare source content - clean section references to avoid breaking immersion
         source_content = "\n\n---\n\n".join(
-            f"**{r['title']}**\n{r['content']}"
+            f"**{clean_section_references(r['title'])}**\n{clean_section_references(r['content'])}"
             for r in results
         )
-        source_titles = [r['title'] for r in results]
+        source_titles = [clean_section_references(r['title']) for r in results]
 
         # Check if this is a follow-up (not first message) - don't re-greet
         is_followup = prior_context.last_response != "" or prior_context.topics_discussed
@@ -943,10 +1122,27 @@ async def generate_response_with_enrichment(
         else:
             name_instruction = "\n\nYou don't know the user's name. Don't make one up."
 
+        # Extract other topics from source titles for safe follow-up suggestions
+        # These are topics we KNOW we have articles on
+        safe_followup_topics = []
+        for title in source_titles[1:4]:  # Skip the main article, use 2-3 others
+            # Extract key topic from title (e.g., "Lost London: Royal Aquarium" -> "Royal Aquarium")
+            if ':' in title:
+                topic = title.split(':')[-1].strip()
+            else:
+                topic = title
+            safe_followup_topics.append(topic)
+
+        safe_topics_hint = ""
+        if safe_followup_topics:
+            safe_topics_hint = f"\n\nSAFE FOLLOW-UP TOPICS (we have articles on these): {', '.join(safe_followup_topics)}"
+
         # Build prompt for Pydantic AI agent
         agent_prompt = f"""Question: "{user_message}"
 {name_instruction}
 {context_enhancement}
+{suggested_followups}
+{safe_topics_hint}
 
 Source material (USE ONLY THESE FACTS):
 {source_content}
@@ -954,8 +1150,14 @@ Source material (USE ONLY THESE FACTS):
 Respond naturally using ONLY facts from the source material above.
 Keep it conversational and under 150 words.
 
+FOLLOW-UP QUESTION RULES:
+1. You MUST end with a follow-up question
+2. ONLY suggest topics from "SAFE FOLLOW-UP TOPICS" or "SUGGESTED FOLLOW-UP TOPICS" above
+3. If no suggestions available, ask about something MENTIONED in the source material (a person, place, or era)
+4. NEVER suggest a random topic we might not have content on
+
 You MUST return a JSON with:
-- response_text: Your natural response to the user
+- response_text: Your natural response (MUST end with a follow-up question about a safe topic)
 - source_titles: List of article titles you used"""
 
         # Try Pydantic AI agent first, fall back to direct Groq if it fails
@@ -1021,6 +1223,9 @@ Respond naturally using facts from above. Keep it conversational and under 150 w
         # Additional post-validation for hallucination patterns
         validated_response = post_validate_response(response_text, source_content)
 
+        # Clean any section/page references that slipped through
+        validated_response = clean_section_references(validated_response)
+
         # Start enrichment in background (non-blocking)
         enrichment_task = asyncio.create_task(
             run_enrichment(
@@ -1068,3 +1273,34 @@ def get_suggestion_teaser(session_id: Optional[str]) -> Optional[str]:
         return f" {top.teaser}"
 
     return None
+
+
+def get_proactive_suggestion(session_id: Optional[str]) -> Optional[str]:
+    """
+    Get a proactive suggestion to offer when user has been silent.
+
+    Uses enrichment context if available, falls back to safe topic clusters.
+    Returns a gentle prompt like "Shall I suggest something?"
+    """
+    import random
+
+    context = get_session_context(session_id)
+
+    # If we have suggestions from enrichment, use the top one
+    if context.enrichment_complete and context.suggestions:
+        top = context.suggestions[0]
+        return f"If you're not sure what to ask, I could tell you about {top.topic}. Would you like that?"
+
+    # If we have discussed topics, suggest something related
+    if context.topics_discussed:
+        last_topic = context.topics_discussed[-1]
+        return f"Would you like me to suggest something related to {last_topic}?"
+
+    # Fallback to safe topic clusters
+    cluster = random.choice(SAFE_TOPIC_CLUSTERS)
+    prompts = [
+        f"If you're not sure where to start, I could tell you about {cluster}.",
+        f"Shall I suggest something? I've got fascinating stories about {cluster}.",
+        f"Would you like me to pick a topic? I could share some tales of {cluster}.",
+    ]
+    return random.choice(prompts)
