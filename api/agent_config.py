@@ -65,21 +65,19 @@ def create_fast_agent() -> Agent[VICAgentDeps, FastVICResponse]:
     """
     Create the fast-path agent for immediate responses.
 
-    Uses Groq Llama 3.1 (840 TPS) with only search_articles tool.
+    Uses Groq Llama 3.1 (840 TPS) - no tools (search done externally).
     Target latency: <2 seconds total.
     """
-    from .tools import search_articles
-
     return Agent(
         'groq:llama-3.1-8b-instant',
         deps_type=VICAgentDeps,
         result_type=FastVICResponse,
         system_prompt=FAST_SYSTEM_PROMPT,
-        tools=[search_articles],
-        retries=1,
+        # No tools - search is done before calling agent
+        retries=2,
         model_settings={
             'temperature': 0.7,
-            'max_tokens': 200,  # Short, punchy responses for voice
+            'max_tokens': 300,  # Slightly more for voice responses
         },
     )
 
