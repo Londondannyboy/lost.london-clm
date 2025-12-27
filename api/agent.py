@@ -958,28 +958,62 @@ You MUST return a JSON with:
 - response_text: Your natural response to the user
 - source_titles: List of article titles you used"""
 
-        # Use Pydantic AI agent for structured, validated response
-        print(f"[VIC Agent] Running Pydantic AI fast_agent...", file=sys.stderr)
-        agent = get_fast_agent()
+        # Try Pydantic AI agent first, fall back to direct Groq if it fails
+        try:
+            print(f"[VIC Agent] Running Pydantic AI fast_agent...", file=sys.stderr)
+            agent = get_fast_agent()
 
-        # Create agent dependencies
-        deps = VICAgentDeps(
-            user_id=user_id,
-            session_id=session_id,
-            user_name=user_name,
-            enrichment_mode=False,
-            prior_entities=[e.name for e in prior_context.entities] if prior_context.entities else [],
-            prior_topics=prior_context.topics_discussed if prior_context.topics_discussed else [],
-        )
+            # Create agent dependencies
+            deps = VICAgentDeps(
+                user_id=user_id,
+                session_id=session_id,
+                user_name=user_name,
+                enrichment_mode=False,
+                prior_entities=[e.name for e in prior_context.entities] if prior_context.entities else [],
+                prior_topics=prior_context.topics_discussed if prior_context.topics_discussed else [],
+            )
 
-        # Run the agent - this enforces FastVICResponse schema validation
-        result = await agent.run(agent_prompt, deps=deps)
-        validated_data = result.data
+            # Run the agent - this enforces FastVICResponse schema validation
+            result = await agent.run(agent_prompt, deps=deps)
+            validated_data = result.data
 
-        print(f"[VIC Agent] Agent returned validated response", file=sys.stderr)
-        print(f"[VIC Agent] Source titles: {validated_data.source_titles}", file=sys.stderr)
+            print(f"[VIC Agent] Agent returned validated response", file=sys.stderr)
+            print(f"[VIC Agent] Source titles: {validated_data.source_titles}", file=sys.stderr)
 
-        response_text = validated_data.response_text
+            response_text = validated_data.response_text
+
+        except Exception as agent_error:
+            # Fallback to direct Groq call if Pydantic AI agent fails
+            print(f"[VIC Agent] Agent failed ({type(agent_error).__name__}), falling back to direct Groq", file=sys.stderr)
+
+            client = get_groq_client()
+            fallback_prompt = f"""Question: "{user_message}"
+{name_instruction}
+
+Source material:
+{source_content}
+
+Respond naturally using facts from above. Keep it conversational and under 150 words."""
+
+            llm_response = await client.post(
+                "/chat/completions",
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "max_tokens": 250,
+                    "messages": [
+                        {"role": "system", "content": VIC_SYSTEM_PROMPT},
+                        {"role": "user", "content": fallback_prompt},
+                    ],
+                },
+            )
+            llm_response.raise_for_status()
+            data = llm_response.json()
+            response_text = data["choices"][0]["message"]["content"]
+
+            # Clean up response
+            import re
+            response_text = re.sub(r'\n*TOPIC_CHECK:.*$', '', response_text, flags=re.DOTALL | re.IGNORECASE)
+            response_text = response_text.strip()
 
         # Additional post-validation for hallucination patterns
         validated_response = post_validate_response(response_text, source_content)
