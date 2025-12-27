@@ -900,8 +900,12 @@ async def generate_response_with_enrichment(
 
     try:
         # Fast path: Search + LLM response
+        print(f"[VIC Enriched] Starting search for: '{user_message}'", file=sys.stderr)
         normalized_query = normalize_query(user_message)
+        print(f"[VIC Enriched] Normalized: '{normalized_query}'", file=sys.stderr)
+
         embedding = await get_voyage_embedding(normalized_query)
+        print(f"[VIC Enriched] Embedding: {len(embedding)} dimensions", file=sys.stderr)
 
         results = await search_articles_hybrid(
             query_embedding=embedding,
@@ -909,6 +913,9 @@ async def generate_response_with_enrichment(
             limit=5,
             similarity_threshold=0.3,
         )
+        print(f"[VIC Enriched] Search returned {len(results)} results", file=sys.stderr)
+        for r in results[:3]:
+            print(f"[VIC Enriched]   - {r.get('title', 'NO TITLE')[:50]} (score: {r.get('score', 0):.4f})", file=sys.stderr)
 
         if not results:
             return (
@@ -986,12 +993,13 @@ Respond naturally using facts from above. Keep it conversational and under 150 w
 
     except Exception as e:
         import traceback
-        error_msg = f"[VIC Agent Error] {type(e).__name__}: {e}"
-        print(error_msg, file=sys.stderr)
+        error_type = type(e).__name__
+        error_msg = str(e)[:100]
+        print(f"[VIC Enriched Error] {error_type}: {error_msg}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
         return (
-            f"I'm having a bit of trouble gathering my thoughts on that one ({type(e).__name__}). "
+            f"I'm having a bit of trouble gathering my thoughts. Error: {error_type}. "
             "Could you perhaps ask me in a different way?",
             None
         )

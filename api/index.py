@@ -457,9 +457,9 @@ async def chat_completions(
     if is_greeting_request:
         # Generate a proper greeting
         if user_name:
-            greeting = f"Hello {user_name}! Wonderful to see you. I'm VIC, and I've got over 370 stories about London's hidden history to share with you. What would you like to explore today?"
+            greeting = f"Hello {user_name}! Wonderful to see you. I'm Vic, and I've got over 370 stories about London's hidden history to share with you. What would you like to explore today?"
         else:
-            greeting = "Hello! I'm VIC, the voice of Vic Keegan. I've got over 370 stories about London's hidden history to share with you. What should I call you, and what would you like to explore?"
+            greeting = "Hello! I'm Vic, the voice of Vic Keegan. I've got over 370 stories about London's hidden history to share with you. What should I call you, and what would you like to explore?"
         return StreamingResponse(
             stream_response(greeting, session_id),
             media_type="text/event-stream",
