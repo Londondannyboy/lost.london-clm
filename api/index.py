@@ -55,14 +55,25 @@ TOPIC_FILLER_PHRASES = [
 
 def extract_topic(user_message: str) -> Optional[str]:
     """Extract a potential topic/subject from the user's message."""
-    # Remove common question words
+    # Remove conversational phrases and common question patterns
     cleaned = re.sub(
-        r'\b(tell me about|what is|who was|where is|when did|how did|can you tell me about)\b',
+        r'\b(tell me about|what is|who was|where is|when did|how did|can you tell me about|'
+        r"i'd like to know about|i would like to know about|"
+        r"that is interesting|that's interesting|that sounds interesting|"
+        r"yes please|no thanks|okay|sure|"
+        r"like to know|want to know|curious about)\b",
         '',
         user_message.lower()
     ).strip()
-    # Take first few significant words
-    words = [w for w in cleaned.split() if len(w) > 3 and w not in ('the', 'and', 'was', 'were', 'have', 'been')]
+
+    # Remove leading punctuation and filler words
+    cleaned = re.sub(r'^[.,!?\s]+', '', cleaned)
+    cleaned = re.sub(r'^\b(the|a|an|some|any)\b\s*', '', cleaned)
+
+    # Take significant words (longer than 3 chars, not common words)
+    stop_words = {'the', 'and', 'was', 'were', 'have', 'been', 'that', 'this', 'with', 'from', 'about', 'like', 'know'}
+    words = [w for w in cleaned.split() if len(w) > 3 and w not in stop_words]
+
     if words:
         # Capitalize and return first 2-3 words as topic
         topic = ' '.join(words[:3]).title()
@@ -122,7 +133,16 @@ def extract_user_message(messages: list[dict]) -> Optional[str]:
                     for part in content
                     if part.get("type") == "text"
                 ]
-                return " ".join(text_parts)
+                content = " ".join(text_parts)
+
+            # Skip Hume instruction messages (not actual user queries)
+            if content and content.lower().startswith("speak your greeting"):
+                continue
+
+            # Strip Hume emotion tags like {very interested, quite contemplative}
+            if content and "{" in content:
+                content = re.sub(r'\s*\{[^}]+\}\s*$', '', content).strip()
+
             return content
     return None
 
@@ -425,6 +445,25 @@ async def chat_completions(
 
     # Use the already extracted user message
     user_message = user_message_extracted
+
+    # Check if this is a greeting request (Hume sends "Speak your greeting")
+    is_greeting_request = any(
+        m.get("role") == "user" and
+        isinstance(m.get("content"), str) and
+        m.get("content", "").lower().startswith("speak your greeting")
+        for m in messages
+    ) and not user_message
+
+    if is_greeting_request:
+        # Generate a proper greeting
+        if user_name:
+            greeting = f"Hello {user_name}! Wonderful to see you. I'm VIC, and I've got over 370 stories about London's hidden history to share with you. What would you like to explore today?"
+        else:
+            greeting = "Hello! I'm VIC, the voice of Vic Keegan. I've got over 370 stories about London's hidden history to share with you. What should I call you, and what would you like to explore?"
+        return StreamingResponse(
+            stream_response(greeting, session_id),
+            media_type="text/event-stream",
+        )
 
     if not user_message:
         # No user message - return a prompt
