@@ -1588,6 +1588,20 @@ If you mention these connections, preface with "From my wider network..." or "I 
                 None
             )
 
+        # Store user query for history tracking (non-blocking)
+        if user_id and results:
+            from .database import store_user_query
+            top_result = results[0]
+            asyncio.create_task(store_user_query(
+                user_id=user_id,
+                query=user_message,
+                article_id=int(top_result.get('id')) if top_result.get('id') else None,
+                article_title=top_result.get('title'),
+                article_slug=top_result.get('title', '').lower().replace(' ', '-').replace("'", ''),
+                session_id=session_id
+            ))
+            print(f"[VIC Agent] Storing query for user {user_id}: {user_message[:50]}...", file=sys.stderr)
+
         # Prepare source content - clean section references to avoid breaking immersion
         source_content = "\n\n---\n\n".join(
             f"**{clean_section_references(r['title'])}**\n{clean_section_references(r['content'])}"
