@@ -1605,15 +1605,18 @@ If you mention these connections, preface with "From my wider network..." or "I 
         if user_id and results:
             from .database import store_user_query
             top_result = results[0]
+            # Use actual article_id and slug from database (not chunk id)
+            article_id = top_result.get('article_id')
+            article_slug = top_result.get('article_slug')
             asyncio.create_task(store_user_query(
                 user_id=user_id,
                 query=user_message,
-                article_id=int(top_result.get('id')) if top_result.get('id') else None,
+                article_id=int(article_id) if article_id else None,
                 article_title=top_result.get('title'),
-                article_slug=top_result.get('title', '').lower().replace(' ', '-').replace("'", ''),
+                article_slug=article_slug,
                 session_id=session_id
             ))
-            print(f"[VIC Agent] Storing query for user {user_id}: {user_message[:50]}...", file=sys.stderr)
+            print(f"[VIC Agent] Storing query for user {user_id}: {user_message[:50]}... (article: {article_slug})", file=sys.stderr)
 
         # Prepare source content - clean section references to avoid breaking immersion
         source_content = "\n\n---\n\n".join(

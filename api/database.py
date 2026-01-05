@@ -120,15 +120,18 @@ async def search_articles_hybrid(
             )
             SELECT
                 kc.id::text,
+                kc.source_id as article_id,
                 kc.title,
                 kc.content,
                 kc.source_type,
+                a.slug as article_slug,
                 r.rrf_score as score,
                 r.vector_score,
                 r.vector_rank,
                 r.keyword_rank
             FROM rrf_combined r
             JOIN knowledge_chunks kc ON kc.id = r.id
+            LEFT JOIN articles a ON kc.source_id = a.id
             ORDER BY r.rrf_score DESC
             LIMIT $3
         """, embedding_json, query_text.lower(), limit)
