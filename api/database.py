@@ -174,6 +174,29 @@ async def get_cached_response(query: str) -> Optional[dict]:
     return None
 
 
+async def store_user_query(
+    user_id: str,
+    query: str,
+    article_id: Optional[int] = None,
+    article_title: Optional[str] = None,
+    article_slug: Optional[str] = None,
+    session_id: Optional[str] = None
+) -> None:
+    """Store a user's query in the user_queries table for history tracking."""
+    if not user_id or not query:
+        return
+
+    try:
+        async with get_connection() as conn:
+            await conn.execute("""
+                INSERT INTO user_queries (user_id, query, article_id, article_title, article_slug, session_id)
+                VALUES ($1, $2, $3, $4, $5, $6)
+            """, user_id, query, article_id, article_title, article_slug, session_id)
+    except Exception as e:
+        import sys
+        print(f"[VIC] Failed to store query: {e}", file=sys.stderr)
+
+
 async def cache_response(query: str, response: str, article_titles: list[str]) -> None:
     """
     Cache a response for a query.
