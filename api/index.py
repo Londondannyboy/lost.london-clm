@@ -534,16 +534,96 @@ async def chat_completions(
         # Check if this is a returning user (after a time gap)
         is_returning, last_topic = check_returning_user(session_id)
 
-        if is_returning and user_name and last_topic:
-            # Returning user with context
-            greeting = f"Ah, {user_name}, good to see you back. Last time we were talking about {last_topic}. Would you like to continue with that, or explore something new?"
+        # Extract user_id to check Zep for their interests
+        user_id = None
+        if session_id and '|' in session_id:
+            user_id = session_id.split('|')[1].split('_')[0]
+
+        # Try to get user's topics from Zep if we don't have local context
+        zep_topics = []
+        if user_id and not last_topic:
+            try:
+                from .agent import get_zep_client, ZEP_API_KEY
+                if ZEP_API_KEY:
+                    client = get_zep_client()
+                    if client:
+                        response = await client.post(
+                            "/api/v2/graph/search",
+                            json={
+                                "user_id": user_id,
+                                "query": "user interested in learning about topics",
+                                "limit": 5,
+                                "scope": "edges",
+                            },
+                        )
+                        if response.status_code == 200:
+                            edges = response.json().get("edges", [])
+                            for edge in edges:
+                                fact = edge.get("fact", "")
+                                # Extract topic from facts like "The user expressed interest in learning about X"
+                                if "interest" in fact.lower() and "learning about" in fact.lower():
+                                    import re
+                                    match = re.search(r"learning about ([^.]+)", fact, re.IGNORECASE)
+                                    if match:
+                                        topic = match.group(1).strip().rstrip('.')
+                                        if topic and len(topic) < 50:
+                                            zep_topics.append(topic)
+                            print(f"[VIC Greeting] Found Zep topics: {zep_topics}", file=sys.stderr)
+            except Exception as e:
+                print(f"[VIC Greeting] Error fetching Zep topics: {e}", file=sys.stderr)
+
+        # Varied greeting templates for returning users with topics
+        import random
+        RETURNING_WITH_TOPIC = [
+            "Ah, {name}, lovely to have you back. Last time you were curious about {topic}. Shall we pick up where we left off, or venture somewhere new?",
+            "Welcome back, {name}. I remember you were exploring {topic}. Would you like to continue that journey, or discover something different?",
+            "{name}, good to see you again. We were discussing {topic} before. Fancy hearing more about that, or shall we wander elsewhere?",
+            "Ah, {name}. I was hoping you'd return. You seemed quite taken with {topic}. More of that, or a fresh adventure?",
+        ]
+
+        # Varied greetings for returning users without specific topic
+        RETURNING_NO_TOPIC = [
+            "Ah, {name}, welcome back to Lost London. What hidden corner shall we explore today?",
+            "{name}, good to see you again. I've been collecting more stories since we last spoke. What takes your fancy?",
+            "Welcome back, {name}. The city has so many secrets yet to share. Where shall we begin?",
+        ]
+
+        # First-time user greetings
+        FIRST_TIME_GREETINGS = [
+            "Ah, hello {name}. I'm Vic, and I've spent years uncovering London's hidden stories. Over 370 of them, in fact. What corner of the city shall we explore together?",
+            "Welcome, {name}. I'm Vic Keegan, and I'd love to share some of London's forgotten tales with you. What piques your curiosity?",
+            "{name}, good to meet you. I'm Vic, collector of London's hidden history. From lost rivers to forgotten palaces, where shall we start?",
+        ]
+
+        # Anonymous user greetings
+        ANONYMOUS_GREETINGS = [
+            "Ah, hello there. I'm Vic, the voice of Vic Keegan. I've spent years uncovering London's hidden stories. What should I call you, and where shall we begin?",
+            "Welcome to Lost London. I'm Vic, and I've collected over 370 stories about this city's secret past. Might I ask your name before we start exploring?",
+        ]
+
+        # Determine the best topic to offer
+        topic_to_offer = last_topic
+        if not topic_to_offer and zep_topics:
+            topic_to_offer = zep_topics[0]
+
+        if user_name and topic_to_offer:
+            # Returning user with a topic to continue
+            template = random.choice(RETURNING_WITH_TOPIC)
+            greeting = template.format(name=user_name, topic=topic_to_offer)
+            mark_name_used(session_id, is_greeting=True)
+        elif user_name and (is_returning or zep_topics):
+            # Returning user but no specific topic
+            template = random.choice(RETURNING_NO_TOPIC)
+            greeting = template.format(name=user_name)
             mark_name_used(session_id, is_greeting=True)
         elif user_name:
-            # New user or same session
-            greeting = f"Ah, hello {user_name}. Good to have you here. I'm Vic, and I've collected over 370 stories about London's hidden history. What corner of the city shall we explore together?"
+            # First-time user with name
+            template = random.choice(FIRST_TIME_GREETINGS)
+            greeting = template.format(name=user_name)
             mark_name_used(session_id, is_greeting=True)
         else:
-            greeting = "Ah, hello there. I'm Vic, the voice of Vic Keegan. I've spent years uncovering London's hidden stories, and I'd love to share them with you. What should I call you, and where shall we begin?"
+            # Anonymous user
+            greeting = random.choice(ANONYMOUS_GREETINGS)
 
         # Mark that we've greeted this session
         mark_greeted_this_session(session_id)
