@@ -1920,6 +1920,15 @@ Respond naturally using facts from above. Keep it conversational and under 150 w
         # Track this topic for popularity metrics
         track_topic(user_message, source_titles)
 
+        # Occasionally add validation encouragement (every ~4th response with pending interests)
+        if user_id and random.randint(1, 4) == 1:
+            pending_count = await get_pending_interest_count(user_id)
+            if pending_count > 0:
+                encouragement = get_validation_encouragement(pending_count)
+                if encouragement:
+                    validated_response += encouragement
+                    print(f"[VIC] Added validation encouragement ({pending_count} pending)", file=sys.stderr)
+
         # Start enrichment in background (non-blocking)
         enrichment_task = asyncio.create_task(
             run_enrichment(
