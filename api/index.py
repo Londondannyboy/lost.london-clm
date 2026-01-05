@@ -557,6 +557,12 @@ async def chat_completions(
 
                     for row in recent:
                         title = row['article_title']
+                        query = row.get('query', '').lower().strip()
+
+                        # Skip affirmations - they're follow-ups, not real topic queries
+                        if query in ['yes', 'no', 'ok', 'okay', 'sure', 'yeah', 'yep', 'nope']:
+                            continue
+
                         if title:
                             # Clean up title - extract main topic
                             # "Vic Keegan's Lost London 103: Thorney Island" -> "Thorney Island"
@@ -564,7 +570,7 @@ async def chat_completions(
                                 topic = title.split(':')[-1].strip()
                             else:
                                 topic = title
-                            if topic and len(topic) < 50:
+                            if topic and len(topic) < 50 and topic not in zep_topics:
                                 zep_topics.append(topic)
 
                     print(f"[VIC Greeting] Recent topics from DB: {zep_topics}", file=sys.stderr)
