@@ -174,6 +174,33 @@ async def get_cached_response(query: str) -> Optional[dict]:
     return None
 
 
+async def get_duplicate_article_ids() -> set[int]:
+    """Get all article IDs that are duplicates (non-canonical versions)."""
+    try:
+        async with get_connection() as conn:
+            results = await conn.fetch("""
+                SELECT article_id_1 as dup_id FROM article_duplicates WHERE article_id_1 != canonical_id
+                UNION
+                SELECT article_id_2 as dup_id FROM article_duplicates WHERE article_id_2 != canonical_id
+            """)
+            return {r['dup_id'] for r in results}
+    except Exception:
+        return set()
+
+
+async def get_canonical_article_id(article_id: int) -> int:
+    """Get the canonical article ID for a potentially duplicate article."""
+    try:
+        async with get_connection() as conn:
+            result = await conn.fetchrow("""
+                SELECT canonical_id FROM article_duplicates
+                WHERE article_id_1 = $1 OR article_id_2 = $1
+            """, article_id)
+            return result['canonical_id'] if result else article_id
+    except Exception:
+        return article_id
+
+
 async def store_user_query(
     user_id: str,
     query: str,

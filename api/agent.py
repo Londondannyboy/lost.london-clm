@@ -1093,6 +1093,15 @@ async def generate_response(user_message: str, session_id: Optional[str] = None,
             similarity_threshold=0.3,  # Lower threshold
         )
 
+        # Filter out duplicate articles (use canonical versions only)
+        from .database import get_duplicate_article_ids
+        duplicate_ids = await get_duplicate_article_ids()
+        if duplicate_ids:
+            original_count = len(results)
+            results = [r for r in results if int(r.get('id', 0)) not in duplicate_ids]
+            if len(results) < original_count:
+                print(f"[VIC Search] Filtered {original_count - len(results)} duplicate articles", file=sys.stderr)
+
         print(f"[VIC Search] Found {len(results)} articles", file=sys.stderr)
         for r in results[:3]:
             print(f"[VIC Search]   - {r.get('title', 'NO TITLE')[:50]} (score: {r.get('score', 0):.4f})", file=sys.stderr)
@@ -1442,8 +1451,25 @@ async def run_enrichment(
         current_topic = source_titles[0] if source_titles else user_message
         print(f"[Enrichment] Generating suggestions for '{current_topic}'", file=sys.stderr)
         suggestions = await suggest_followup_topics(mock_ctx, current_topic, entity_names)
-        context.suggestions = suggestions
-        print(f"[Enrichment] Generated {len(context.suggestions)} suggestions", file=sys.stderr)
+
+        # Deduplicate suggestions (remove similar topic names)
+        seen_topics = set()
+        deduped_suggestions = []
+        for s in suggestions:
+            # Normalize topic name for comparison
+            normalized = s.topic.lower().replace("the ", "").replace("'s", "").strip()
+            # Also check partial matches (e.g., "Crystal Palace" vs "The other Crystal Palace")
+            is_duplicate = False
+            for seen in seen_topics:
+                if normalized in seen or seen in normalized:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                seen_topics.add(normalized)
+                deduped_suggestions.append(s)
+
+        context.suggestions = deduped_suggestions
+        print(f"[Enrichment] Generated {len(context.suggestions)} suggestions (deduped from {len(suggestions)})", file=sys.stderr)
 
         # Update context
         context.topics_discussed.append(current_topic)
