@@ -72,11 +72,10 @@ BANNED_WORDS = {
 
 # Patterns that indicate potentially inappropriate content
 SUSPICIOUS_PATTERNS = [
-    r'\b(fuck|shit|ass|bitch|dick|cock|pussy|penis|balls|tits|boobs|wank|shag|bollocks)\b',  # Profanity
-    r'\b(sex|porn|nude|naked|xxx|nsfw)\b',  # Sexual content
+    r'\b(fuck|shit|ass|bitch|dick|cock|pussy)\b',  # Profanity
+    r'\b(sex|porn|nude|naked)\b',  # Sexual content
     r'\b(kill|murder|rape|assault)\b.*\b(you|me|them|her|him)\b',  # Violent threats
     r'\b(racist|sexist)\s+joke',  # Discriminatory content requests
-    r'\b(jerk\s*off|blow\s*job|hand\s*job)\b',  # Explicit phrases
 ]
 
 # Patterns that suggest off-topic (not London history)

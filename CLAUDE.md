@@ -107,6 +107,8 @@ Added back the smart greeting system without heavy dependencies:
 
 **Key insight**: Uses actual `user_queries` database table for topics, NOT Zep inference (which sometimes hallucinated topics like "London Bridge" from Thames associations).
 
+**Bug fix (Jan 6)**: SQL query was failing silently - PostgreSQL doesn't allow `ORDER BY` columns not in `SELECT` when using `DISTINCT`. Fixed by using `GROUP BY` with `MAX(created_at)` in a subquery.
+
 ### Session Context Tracking
 Added to `SessionContext` dataclass:
 - `current_topic: str` - What they're currently discussing
@@ -121,9 +123,36 @@ Added to `SessionContext` dataclass:
 - `set_current_topic(session_id, topic)` - Track discussion topic
 - `extract_emotion_from_message(content)` - Parse Hume emotion tags
 
+### Content Validation & Moderation (Jan 6)
+
+Added `api/validation.py` with fast rule-based content moderation (no LLM needed):
+
+**How it works:**
+1. Check for banned words (slurs, explicit content) → Immediate block
+2. Check suspicious patterns (profanity, sexual, violent) → Block with warning
+3. Check off-topic patterns (crypto, politics, personal) → Redirect to London history
+
+**Categories:**
+| Category | Example | Response |
+|----------|---------|----------|
+| `offensive` | Slurs, hate speech | "I can't engage with that kind of language..." |
+| `inappropriate` | Profanity, sexual | "That's not quite the sort of topic I cover..." |
+| `off_topic` | Bitcoin, politics | "That's outside my area of expertise..." |
+| `spam` | Diet pills, forex | Blocked |
+| `safe` | London history | Normal response |
+
+**Integration:**
+- `validate_user_input()` called at start of `generate_response_with_enrichment()`
+- If invalid, returns warning message immediately (no LLM cost)
+- Validated content stored to Zep; invalid content is not stored
+
+**Key files:**
+- `api/validation.py` - All validation rules and patterns
+- `api/agent.py:1184` - Validation check integration
+
 ## TODO - Still to Reintroduce
 
-1. [ ] Content validation - use Groq instead of Gemini
+1. [x] ~~Content validation~~ - Done (fast rule-based)
 2. [ ] Human-in-the-loop validation (frontend already has UI)
 
 ## Commands
