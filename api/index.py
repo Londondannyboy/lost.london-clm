@@ -36,6 +36,13 @@ from .agent import (
     is_affirmation,
     get_last_suggestion,
     set_last_suggestion,
+    check_returning_user,
+    update_interaction_time,
+    mark_greeted_this_session,
+    set_current_topic,
+    set_user_emotion,
+    get_emotion_adjustment,
+    extract_emotion_from_message,
 )
 from .database import Database
 from .tools import save_user_message
@@ -501,13 +508,72 @@ async def chat_completions(
     )
 
     if is_greeting_request:
-        # Generate a proper greeting - warm and conversational, like Vic chatting over tea
-        # Avoid exclamation marks - they make the TTS sound too excited/different
-        if user_name:
+        # Smart greeting based on returning user status and their interests
+        import sys
+
+        # Check if this is a returning user
+        is_returning, last_topic = check_returning_user(session_id)
+
+        # Try to get user's recent topics from database (more reliable than Zep inference)
+        user_topics = []
+        user_id = None
+        if session_id and '|' in session_id:
+            user_id = session_id.split('|')[1].split('_')[0]
+
+        if user_id:
+            try:
+                from .database import get_connection
+                async with get_connection() as conn:
+                    recent = await conn.fetch("""
+                        SELECT DISTINCT article_title
+                        FROM user_queries
+                        WHERE user_id = $1 AND article_title IS NOT NULL
+                        ORDER BY created_at DESC
+                        LIMIT 3
+                    """, user_id)
+
+                    for row in recent:
+                        title = row['article_title']
+                        if title:
+                            # Clean title: "Vic Keegan's Lost London 103: Thorney Island" -> "Thorney Island"
+                            if ':' in title:
+                                topic = title.split(':')[-1].strip()
+                            else:
+                                topic = title
+                            if topic and len(topic) < 50 and topic not in user_topics:
+                                user_topics.append(topic)
+                    print(f"[VIC Greeting] Found topics for {user_id}: {user_topics}", file=sys.stderr)
+            except Exception as e:
+                print(f"[VIC Greeting] Error fetching topics: {e}", file=sys.stderr)
+
+        # Generate appropriate greeting
+        if is_returning and last_topic:
+            # Returning user with known topic
+            if user_name:
+                greeting = f"Ah, welcome back {user_name}. Shall we pick up where we left off with {last_topic}, or would you like to explore something new?"
+                mark_name_used(session_id, is_greeting=True)
+            else:
+                greeting = f"Welcome back. Last time we were exploring {last_topic}. Shall we continue, or would you prefer something different?"
+        elif user_topics:
+            # Known user with topic history
+            topic = user_topics[0]
+            if user_name:
+                greeting = f"Hello again {user_name}. I remember you were interested in {topic}. Shall we explore more of that, or venture somewhere new in London's history?"
+                mark_name_used(session_id, is_greeting=True)
+            else:
+                greeting = f"Hello again. I recall you enjoyed learning about {topic}. Would you like to hear more, or shall we explore something different?"
+        elif user_name:
+            # New user with name
             greeting = f"Ah, hello {user_name}. Good to have you here. I'm Vic, and I've collected over 370 stories about London's hidden history. What corner of the city shall we explore together?"
             mark_name_used(session_id, is_greeting=True)
         else:
+            # Completely new user
             greeting = "Ah, hello there. I'm Vic, the voice of Vic Keegan. I've spent years uncovering London's hidden stories, and I'd love to share them with you. What should I call you, and where shall we begin?"
+
+        # Mark that we've greeted this session
+        mark_greeted_this_session(session_id)
+        update_interaction_time(session_id)
+
         return StreamingResponse(
             stream_response(greeting, session_id),
             media_type="text/event-stream",
@@ -554,6 +620,13 @@ async def chat_completions(
 
     # Always increment turn counter for tracking
     increment_turn_counter(session_id)
+
+    # Update interaction time for returning user detection
+    update_interaction_time(session_id)
+
+    # Track the topic being discussed (for "still interested in..." greetings)
+    if topic_extracted:
+        set_current_topic(session_id, topic_extracted)
 
     # OPTIMIZATION: Stream filler phrases while generating response
     # This disguises the delay and makes VIC feel more responsive

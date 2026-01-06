@@ -88,13 +88,43 @@ User Voice → Hume EVI → vic-clm.vercel.app/chat/completions → Response
 - The Dec 27 commit was a clean, stable state
 - Tag important stable versions for easy rollback
 
-## TODO - Reintroduce Lost Features
-The Jan 5th features were good but need to be reintroduced without the heavy dependencies:
+## Reintroduced Features (Jan 6, 2026)
+
+### Smart Returning User Greetings
+Added back the smart greeting system without heavy dependencies:
+
+**How it works:**
+1. Tracks `last_interaction_time` and `current_topic` per session
+2. If user returns after 5+ minutes gap, offers to continue their topic
+3. Looks up user's actual query history from `user_queries` table (ground truth)
+4. Falls back gracefully for new users
+
+**Greeting variations:**
+- **Returning user with topic**: "Welcome back {name}. Shall we pick up where we left off with {topic}?"
+- **Known user with history**: "Hello again {name}. I remember you were interested in {topic}."
+- **New user with name**: "Ah, hello {name}. I'm Vic, and I've collected over 370 stories..."
+- **Anonymous user**: "Ah, hello there. I'm Vic, the voice of Vic Keegan..."
+
+**Key insight**: Uses actual `user_queries` database table for topics, NOT Zep inference (which sometimes hallucinated topics like "London Bridge" from Thames associations).
+
+### Session Context Tracking
+Added to `SessionContext` dataclass:
+- `current_topic: str` - What they're currently discussing
+- `last_interaction_time: float` - For returning user detection
+- `greeted_this_session: bool` - Prevent double greetings
+- `user_emotion: str` - From Hume emotion tags (for future use)
+
+### Helper Functions Added
+- `check_returning_user(session_id)` - Returns (is_returning, last_topic)
+- `update_interaction_time(session_id)` - Call after each response
+- `mark_greeted_this_session(session_id)` - Prevent greeting loops
+- `set_current_topic(session_id, topic)` - Track discussion topic
+- `extract_emotion_from_message(content)` - Parse Hume emotion tags
+
+## TODO - Still to Reintroduce
 
 1. [ ] Content validation - use Groq instead of Gemini
-2. [ ] Returning user greetings - check if this was in Dec 27 version
-3. [ ] Query tracking to database
-4. [ ] Human-in-the-loop validation
+2. [ ] Human-in-the-loop validation (frontend already has UI)
 
 ## Commands
 

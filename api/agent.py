@@ -49,6 +49,18 @@ class SessionContext:
     name_used_in_greeting: bool = False
     # Track the last suggestion VIC made for affirmation handling
     last_suggested_topic: str = ""
+    # Track the current topic for returning user detection
+    current_topic: str = ""
+    # Track last interaction time for returning user detection
+    last_interaction_time: float = 0.0
+    # Flag if we're already greeted this session
+    greeted_this_session: bool = False
+    # Track user's emotional state from Hume
+    user_emotion: str = ""
+
+
+# Returning user threshold - 5 minutes gap = returning user
+RETURNING_USER_GAP_SECONDS = 300
 
 
 # Affirmation patterns - user confirming a suggestion
@@ -137,6 +149,124 @@ def increment_turn_counter(session_id: Optional[str]) -> None:
     context = get_session_context(session_id)
     context.turns_since_name_used += 1
     update_session_context(session_id, context)
+
+
+# =============================================================================
+# Returning User Detection
+# =============================================================================
+
+def check_returning_user(session_id: Optional[str]) -> tuple[bool, Optional[str]]:
+    """
+    Check if this is a returning user (after a time gap).
+
+    Returns (is_returning, last_topic):
+    - (True, "Thorney Island") = user is back after gap, was discussing this
+    - (False, None) = same session or new user
+    """
+    import time
+
+    if not session_id:
+        return (False, None)
+
+    context = get_session_context(session_id)
+
+    # If already greeted this session, not returning
+    if context.greeted_this_session:
+        return (False, None)
+
+    # If no previous interaction, not returning
+    if context.last_interaction_time == 0:
+        return (False, None)
+
+    # Check time gap
+    current_time = time.time()
+    gap = current_time - context.last_interaction_time
+
+    if gap >= RETURNING_USER_GAP_SECONDS and context.current_topic:
+        return (True, context.current_topic)
+
+    return (False, None)
+
+
+def update_interaction_time(session_id: Optional[str]) -> None:
+    """Update the last interaction time for returning user detection."""
+    import time
+
+    if not session_id:
+        return
+
+    context = get_session_context(session_id)
+    context.last_interaction_time = time.time()
+    update_session_context(session_id, context)
+
+
+def mark_greeted_this_session(session_id: Optional[str]) -> None:
+    """Mark that we've already greeted the user in this session."""
+    if not session_id:
+        return
+
+    context = get_session_context(session_id)
+    context.greeted_this_session = True
+    update_session_context(session_id, context)
+
+
+def set_current_topic(session_id: Optional[str], topic: str) -> None:
+    """Set the current topic being discussed."""
+    if not session_id or not topic:
+        return
+
+    context = get_session_context(session_id)
+    context.current_topic = topic
+    if topic not in context.topics_discussed:
+        context.topics_discussed.append(topic)
+    update_session_context(session_id, context)
+
+
+def set_user_emotion(session_id: Optional[str], emotion: str) -> None:
+    """Store the user's current emotion from Hume."""
+    if not session_id:
+        return
+
+    context = get_session_context(session_id)
+    context.user_emotion = emotion
+    update_session_context(session_id, context)
+
+
+def get_emotion_adjustment(session_id: Optional[str]) -> Optional[str]:
+    """Get response adjustment hint based on user's emotion."""
+    if not session_id:
+        return None
+
+    context = get_session_context(session_id)
+    emotion = context.user_emotion.lower()
+
+    # Map emotions to response adjustments
+    if "confused" in emotion:
+        return "Explain simply and clearly."
+    elif "interested" in emotion or "curious" in emotion:
+        return "Share more detail and enthusiasm."
+    elif "bored" in emotion:
+        return "Keep it brief. Offer to switch topics."
+    elif "skeptical" in emotion:
+        return "Be precise with facts."
+
+    return None
+
+
+def extract_emotion_from_message(content: str) -> tuple[str, str]:
+    """
+    Extract emotion tags from Hume message.
+
+    Returns (cleaned_message, emotion_string)
+    e.g., "hello {interested, curious}" -> ("hello", "interested, curious")
+    """
+    import re
+    match = re.search(r'\{([^}]+)\}\s*$', content)
+    if match:
+        emotion = match.group(1)
+        cleaned = re.sub(r'\s*\{[^}]+\}\s*$', '', content).strip()
+        return (cleaned, emotion)
+    return (content, "")
 
 
 def is_affirmation(message: str) -> tuple[bool, Optional[str]]:
